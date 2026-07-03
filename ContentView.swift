@@ -1,32 +1,24 @@
 //
 //  ContentView.swift
-//  SwingPlane – Fase A (de-risk: kamera-capture + pose + framing-fundament)
+//  SwingPlane – Fase A (kamera + pose + framing + klip-bibliotek)
 //
-//  ALT i én fil, så den kan erstatte den auto-genererede ContentView.swift
-//  direkte (ingen nye filer at tilføje i Xcode).
+//  ALT i én fil (pipeline-fil). Build 4-batch:
+//   - App-privat lager (klip i Documents/clips, IKKE kamerarullen), tagget med vinkel+dato
+//   - "Seneste sving"-bibliotek: filter Face-on/DTL/Begge + in-app afspilning
+//   - "Vis skelet" i afspilleren: Vision-pose på det aktuelle frame (validering, pause+se)
+//   - Spejlvendings-fix: isVideoMirrored=false lige før optagelse
+//   - Afstands-rekalibrering (krop 42-72% af højden) + club-headroom-gate
+//   + tidligere: front-default+flip, høj-fps-format, live pose-overlay, vater,
+//     krop-i-frame, vinkel-aflæsning, lyd-meter/impact.
 //
-//  Build 3-batch:
-//   - Front-kamera default + flip (bag = 240fps, front = 120fps)
-//   - Bedste høj-fps-format, ingen spejling i gemt fil
-//   - Vision 2D-pose-overlay + aflæsning (antal led/konfidens)
-//   - Vater-indikator (CoreMotion)
-//   - Krop-i-frame + afstands-guide (fra pose)
-//   - Vinkel-aflæsning DTL/Face-on/Diagonal (skulder-linje)
-//   - Lyd-niveau-meter + impact-blink
-//   - DTL/Face-on-vælger + samlet framing-tjekliste
-//
-//  TUNING-PUNKTER (forventet finjustering PÅ enheden, ikke compile):
-//   1) Pose-orientering/spejling (visionOrientation) — hvis skelettet står
-//      roteret/spejlet, er det her knappen sidder.
-//   2) Lyd-format i audioPeak() — håndterer Float32 + Int16; hvis meteret er dødt
-//      er det formatet.
-//   3) Framing-tærskler (distance/vinkel) er første-gæt, kalibreres mod rigtige klip.
+//  TUNING-PUNKTER (device, ikke compile): pose-orientering (visionOrientation),
+//  lyd-format (audioPeak), framing-tærskler.
 //
 
 import SwiftUI
 import Combine
 import AVFoundation
-import Photos
+import AVKit
 import Vision
 import CoreMotion
 
@@ -35,57 +27,99 @@ typealias PoseDict = [VNHumanBodyPoseObservation.JointName: CGPoint]
 enum SwingView: String, CaseIterable {
     case faceOn = "Face-on"
     case dtl = "DTL"
+    var fileKey: String { self == .dtl ? "DTL" : "FaceOn" }
+    static func fromFileKey(_ s: String) -> SwingView { s == "DTL" ? .dtl : .faceOn }
 }
 
-// MARK: - View
+// MARK: - Klip-model + lager (app-privat)
+
+struct Clip: Identifiable {
+    let id = UUID()
+    let url: URL
+    let view: SwingView
+    let date: Date
+}
+
+final class ClipStore: ObservableObject {
+    @Published var clips: [Clip] = []
+
+    static let directory: URL = {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("clips", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    static func newURL(view: SwingView) -> URL {
+        let ts = Int(Date().timeIntervalSince1970)
+        return directory.appendingPathComponent("swing_\(ts)_\(view.fileKey).mov")
+    }
+
+    func reload() {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: Self.directory, includingPropertiesForKeys: nil)) ?? []
+        var result: [Clip] = []
+        for url in files where url.pathExtension == "mov" {
+            let parts = url.deletingPathExtension().lastPathComponent.split(separator: "_")
+            guard parts.count >= 3, let ts = Double(parts[1]) else { continue }
+            result.append(Clip(url: url,
+                               view: SwingView.fromFileKey(String(parts[2])),
+                               date: Date(timeIntervalSince1970: ts)))
+        }
+        clips = result.sorted { $0.date > $1.date }
+    }
+
+    func delete(_ clip: Clip) {
+        try? FileManager.default.removeItem(at: clip.url)
+        reload()
+    }
+}
+
+// MARK: - Rod-view (kamera + bibliotek-sheet)
 
 struct ContentView: View {
     @StateObject private var camera = CameraManager()
+    @StateObject private var store = ClipStore()
+    @State private var showLibrary = false
 
     var body: some View {
         ZStack {
-            // Live-preview
             if camera.permissionGranted {
                 CameraPreview(session: camera.session).ignoresSafeArea()
             } else {
                 Color.black.ignoresSafeArea()
             }
 
-            // Pose-skelet-overlay
             PoseOverlay(pose: camera.pose, videoSize: camera.videoPortraitSize)
-                .allowsHitTesting(false)
-                .ignoresSafeArea()
+                .allowsHitTesting(false).ignoresSafeArea()
 
-            // Lyd-meter (venstre kant)
             HStack {
                 AudioMeter(level: camera.audioLevel, impact: camera.impactFlash)
-                    .frame(width: 8)
-                    .padding(.leading, 6)
+                    .frame(width: 8).padding(.leading, 6)
                 Spacer()
-            }
-            .ignoresSafeArea(edges: .vertical)
+            }.ignoresSafeArea(edges: .vertical)
 
             VStack(spacing: 8) {
-                // Kamera + fps
+                HStack {
+                    Button { showLibrary = true } label: {
+                        Image(systemName: "square.stack.3d.up.fill")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(12).background(.black.opacity(0.55)).clipShape(Circle())
+                    }
+                    Spacer()
+                }
                 badge(camera.statusText)
-                // Pose-aflæsning
                 badge(camera.poseInfo)
-
-                // Framing-tjekliste
-                FramingChecklist(camera: camera)
-                    .padding(.top, 4)
+                FramingChecklist(camera: camera).padding(.top, 4)
 
                 Spacer()
 
-                // DTL / Face-on-vælger
                 Picker("Vinkel", selection: $camera.selectedView) {
                     ForEach(SwingView.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
-                .padding(.bottom, 6)
+                .pickerStyle(.segmented).frame(width: 220).padding(.bottom, 6)
 
-                // Bund-kontroller: optageknap centreret, flip til højre
                 ZStack {
                     Button(action: { camera.toggleRecording() }) {
                         ZStack {
@@ -93,8 +127,7 @@ struct ContentView: View {
                             Circle().fill(camera.isRecording ? Color.red : Color.white)
                                 .frame(width: 70, height: 70)
                         }
-                    }
-                    .disabled(!camera.permissionGranted)
+                    }.disabled(!camera.permissionGranted)
 
                     HStack {
                         Spacer()
@@ -102,61 +135,186 @@ struct ContentView: View {
                             Image(systemName: "arrow.triangle.2.circlepath.camera")
                                 .font(.system(size: 24, weight: .semibold))
                                 .foregroundStyle(.white)
-                                .padding(16)
-                                .background(.black.opacity(0.55))
-                                .clipShape(Circle())
+                                .padding(16).background(.black.opacity(0.55)).clipShape(Circle())
                         }
                         .disabled(!camera.permissionGranted || camera.isRecording)
                         .padding(.trailing, 32)
                     }
-                }
-                .padding(.bottom, 40)
+                }.padding(.bottom, 40)
             }
-            .padding(.top, 12)
+            .padding([.horizontal, .top], 12)
         }
-        .onAppear { camera.start() }
+        .onAppear {
+            camera.onClipSaved = { store.reload() }
+            camera.start()
+            store.reload()
+        }
+        .sheet(isPresented: $showLibrary) { LibraryView(store: store) }
     }
 
     private func badge(_ text: String) -> some View {
         Text(text)
             .font(.caption.weight(.semibold))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.black.opacity(0.55))
-            .foregroundStyle(.white)
-            .clipShape(Capsule())
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.black.opacity(0.55)).foregroundStyle(.white).clipShape(Capsule())
     }
 }
 
 #Preview { ContentView() }
 
-// MARK: - Pose-overlay (Canvas)
+// MARK: - Bibliotek
+
+struct LibraryView: View {
+    @ObservedObject var store: ClipStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var filter: SwingView? = nil
+
+    private var filtered: [Clip] {
+        guard let f = filter else { return store.clips }
+        return store.clips.filter { $0.view == f }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("Filter", selection: $filter) {
+                    Text("Begge").tag(nil as SwingView?)
+                    Text("Face-on").tag(SwingView.faceOn as SwingView?)
+                    Text("DTL").tag(SwingView.dtl as SwingView?)
+                }
+                .pickerStyle(.segmented).padding()
+
+                if filtered.isEmpty {
+                    Spacer()
+                    Text("Ingen sving endnu").foregroundStyle(.secondary)
+                    Spacer()
+                } else {
+                    List {
+                        ForEach(filtered) { clip in
+                            NavigationLink { ClipPlayerView(clip: clip) } label: { ClipRow(clip: clip) }
+                        }
+                        .onDelete { offsets in offsets.forEach { store.delete(filtered[$0]) } }
+                    }
+                }
+            }
+            .navigationTitle("Seneste sving")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Luk") { dismiss() }
+                }
+            }
+        }
+        .onAppear { store.reload() }
+    }
+}
+
+struct ClipRow: View {
+    let clip: Clip
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "d. MMM HH:mm"; return f
+    }()
+    var body: some View {
+        HStack {
+            Image(systemName: clip.view == .dtl ? "figure.golf" : "person.fill")
+                .foregroundStyle(.green)
+            VStack(alignment: .leading) {
+                Text(clip.view.rawValue).font(.body.weight(.semibold))
+                Text(Self.fmt.string(from: clip.date)).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "play.circle").foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Afspiller + skelet-validering
+
+struct ClipPlayerView: View {
+    let clip: Clip
+    @State private var player = AVPlayer()
+    @State private var showSkeleton = false
+    @State private var pose: PoseDict = [:]
+    @State private var videoSize: CGSize = .zero
+
+    var body: some View {
+        VStack {
+            ZStack {
+                VideoPlayer(player: player)
+                if showSkeleton {
+                    PoseOverlay(pose: pose, videoSize: videoSize, fill: false)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(maxHeight: 480)
+
+            Button(showSkeleton ? "Skjul skelet" : "Vis skelet på dette frame") {
+                if showSkeleton { showSkeleton = false } else { analyzeFrame() }
+            }
+            .buttonStyle(.borderedProminent)
+            .padding()
+
+            Text("Pause videoen på det ønskede frame og tryk for at validere pose.")
+                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .padding(.horizontal)
+            Spacer()
+        }
+        .navigationTitle(clip.view.rawValue)
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { player.replaceCurrentItem(with: AVPlayerItem(url: clip.url)) }
+        .onDisappear { player.pause() }
+    }
+
+    private func analyzeFrame() {
+        player.pause()
+        let asset = AVURLAsset(url: clip.url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        gen.generateCGImageAsynchronously(for: player.currentTime()) { cg, _, _ in
+            guard let cg else { return }
+            let handler = VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:])
+            let req = VNDetectHumanBodyPoseRequest()
+            try? handler.perform([req])
+            var result: PoseDict = [:]
+            if let obs = req.results?.first, let pts = try? obs.recognizedPoints(.all) {
+                for (name, p) in pts where p.confidence > 0.3 {
+                    result[name] = CGPoint(x: p.location.x, y: 1 - p.location.y)
+                }
+            }
+            let size = CGSize(width: cg.width, height: cg.height)
+            DispatchQueue.main.async {
+                self.pose = result
+                self.videoSize = size
+                self.showSkeleton = true
+            }
+        }
+    }
+}
+
+// MARK: - Pose-overlay
 
 struct PoseOverlay: View {
     let pose: PoseDict
     let videoSize: CGSize
+    var fill: Bool = true
 
     var body: some View {
         Canvas { ctx, size in
             guard videoSize.width > 0, videoSize.height > 0, !pose.isEmpty else { return }
-            // aspectFill-mapping fra portræt-normaliserede punkter til view
-            let scale = max(size.width / videoSize.width, size.height / videoSize.height)
-            let dispW = videoSize.width * scale
-            let dispH = videoSize.height * scale
-            let ox = (size.width - dispW) / 2
-            let oy = (size.height - dispH) / 2
-            func p(_ n: CGPoint) -> CGPoint {
-                CGPoint(x: ox + n.x * dispW, y: oy + n.y * dispH)
-            }
-            // knogler
+            let scale = fill
+                ? max(size.width / videoSize.width, size.height / videoSize.height)
+                : min(size.width / videoSize.width, size.height / videoSize.height)
+            let dispW = videoSize.width * scale, dispH = videoSize.height * scale
+            let ox = (size.width - dispW) / 2, oy = (size.height - dispH) / 2
+            func p(_ n: CGPoint) -> CGPoint { CGPoint(x: ox + n.x * dispW, y: oy + n.y * dispH) }
+
             for (a, b) in CameraManager.bones {
                 if let pa = pose[a], let pb = pose[b] {
-                    var path = Path()
-                    path.move(to: p(pa)); path.addLine(to: p(pb))
+                    var path = Path(); path.move(to: p(pa)); path.addLine(to: p(pb))
                     ctx.stroke(path, with: .color(.green.opacity(0.9)), lineWidth: 3)
                 }
             }
-            // led
             for (_, n) in pose {
                 let q = p(n)
                 ctx.fill(Path(ellipseIn: CGRect(x: q.x - 4, y: q.y - 4, width: 8, height: 8)),
@@ -169,15 +327,13 @@ struct PoseOverlay: View {
 // MARK: - Lyd-meter
 
 struct AudioMeter: View {
-    let level: Float      // 0..1
+    let level: Float
     let impact: Bool
-
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .bottom) {
                 Capsule().fill(.black.opacity(0.4))
-                Capsule()
-                    .fill(impact ? Color.red : Color.green)
+                Capsule().fill(impact ? Color.red : Color.green)
                     .frame(height: geo.size.height * CGFloat(min(max(level, 0), 1)))
             }
         }
@@ -189,22 +345,20 @@ struct AudioMeter: View {
 
 struct FramingChecklist: View {
     @ObservedObject var camera: CameraManager
-
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             row("Telefon i vater", camera.isLevel)
             row("Hele kroppen i frame", camera.bodyInFrame)
             row(camera.distanceHint.isEmpty ? "God afstand" : camera.distanceHint, camera.distanceOK)
+            row("Plads til køllen", camera.clubHeadroom)
             row("Vinkel: \(camera.detectedAngle)", camera.angleMatches)
             if camera.framingReady {
                 Text("KLAR").font(.caption.bold()).foregroundStyle(.green)
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(.black.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(.black.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
-
     private func row(_ text: String, _ ok: Bool) -> some View {
         HStack(spacing: 6) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle")
@@ -235,7 +389,6 @@ struct CameraPreview: UIViewRepresentable {
 
 final class CameraManager: NSObject, ObservableObject {
 
-    // Kamera-tilstand
     @Published var isRecording = false
     @Published var permissionGranted = false
     @Published var statusText = "Anmoder om adgang…"
@@ -244,23 +397,23 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var isFrontCamera = true
     @Published var videoPortraitSize = CGSize(width: 1080, height: 1920)
 
-    // Pose
     @Published var pose: PoseDict = [:]
     @Published var poseInfo = "Pose: —"
 
-    // Framing-gates
     @Published var isLevel = false
     @Published var bodyInFrame = false
     @Published var distanceOK = false
     @Published var distanceHint = ""
+    @Published var clubHeadroom = false
     @Published var detectedAngle = "—"
     @Published var angleMatches = false
     @Published var selectedView: SwingView = .faceOn { didSet { recomputeFraming() } }
-    var framingReady: Bool { isLevel && bodyInFrame && distanceOK && angleMatches }
+    var framingReady: Bool { isLevel && bodyInFrame && distanceOK && clubHeadroom && angleMatches }
 
-    // Lyd
     @Published var audioLevel: Float = 0
     @Published var impactFlash = false
+
+    var onClipSaved: (() -> Void)?
 
     let session = AVCaptureSession()
 
@@ -275,6 +428,7 @@ final class CameraManager: NSObject, ObservableObject {
     private var lastPoseTime = CFAbsoluteTimeGetCurrent()
     private var lastAudioUI = CFAbsoluteTimeGetCurrent()
     private let motion = CMMotionManager()
+    private var recordingView: SwingView = .faceOn
 
     private var startPosition: AVCaptureDevice.Position { isFrontCamera ? .front : .back }
     private var visionOrientation: CGImagePropertyOrientation { isFrontCamera ? .leftMirrored : .right }
@@ -308,17 +462,14 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: Konfiguration
     private func configureSession() {
         session.beginConfiguration()
-
         guard addVideoInput(position: startPosition) else {
             session.commitConfiguration(); setStatus("Kunne ikke tilgå kameraet"); return
         }
-
         if let audioDevice = AVCaptureDevice.default(for: .audio),
            let audioInput = try? AVCaptureDeviceInput(device: audioDevice),
            session.canAddInput(audioInput) {
             session.addInput(audioInput)
         }
-
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
 
         videoDataOutput.alwaysDiscardsLateVideoFrames = true
@@ -328,9 +479,7 @@ final class CameraManager: NSObject, ObservableObject {
         audioDataOutput.setSampleBufferDelegate(self, queue: audioQueue)
         if session.canAddOutput(audioDataOutput) { session.addOutput(audioDataOutput) }
 
-        applyNoMirroring()
         session.commitConfiguration()
-
         if let device = videoDeviceInput?.device { configureHighFrameRate(device: device) }
         session.startRunning()
     }
@@ -344,7 +493,9 @@ final class CameraManager: NSObject, ObservableObject {
         return true
     }
 
-    private func applyNoMirroring() {
+    /// Sæt "ingen spejling" på den LIVE movie-forbindelse (kaldes lige før optagelse,
+    /// hvor forbindelsen findes — ellers rammer det ingenting).
+    private func disableMirrorOnMovie() {
         if let c = movieOutput.connection(with: .video), c.isVideoMirroringSupported {
             c.automaticallyAdjustsVideoMirroring = false
             c.isVideoMirrored = false
@@ -359,7 +510,6 @@ final class CameraManager: NSObject, ObservableObject {
             self.session.beginConfiguration()
             self.session.removeInput(current)
             if self.addVideoInput(position: newPos) {
-                self.applyNoMirroring()
                 Task { @MainActor in self.isFrontCamera = (newPos == .front) }
             } else {
                 self.session.addInput(current); self.videoDeviceInput = current
@@ -384,7 +534,6 @@ final class CameraManager: NSObject, ObservableObject {
             if ra.1 != rb.1 { return ra.1 < rb.1 }
             return ra.2 < rb.2
         }) else { return }
-
         do {
             try device.lockForConfiguration()
             device.activeFormat = chosen
@@ -393,7 +542,6 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeVideoMinFrameDuration = dur
             device.activeVideoMaxFrameDuration = dur
             device.unlockForConfiguration()
-
             let dims = CMVideoFormatDescriptionGetDimensions(chosen.formatDescription)
             let cam = (device.position == .front) ? "Front" : "Bag"
             let portrait = CGSize(width: CGFloat(min(dims.width, dims.height)),
@@ -407,36 +555,38 @@ final class CameraManager: NSObject, ObservableObject {
         } catch { setStatus("Kunne ikke sætte fps: \(error.localizedDescription)") }
     }
 
-    // MARK: Vater (CoreMotion)
+    // MARK: Vater
     private func startMotion() {
         guard motion.isDeviceMotionAvailable else { return }
         motion.deviceMotionUpdateInterval = 0.1
         motion.startDeviceMotionUpdates(to: .main) { [weak self] m, _ in
             guard let self, let m else { return }
-            // Roll = venstre/højre-hældning når telefonen står lodret i portræt.
             let roll = atan2(m.gravity.x, -m.gravity.y) * 180 / .pi
-            self.isLevel = abs(roll) < 4          // ±4° tolerance (tuning)
+            self.isLevel = abs(roll) < 4
             self.recomputeFraming()
         }
     }
 
     // MARK: Optagelse
     func toggleRecording() {
+        let view = selectedView
         sessionQueue.async {
             if self.movieOutput.isRecording {
                 self.movieOutput.stopRecording()
             } else {
+                self.recordingView = view
+                self.disableMirrorOnMovie()      // live-forbindelse findes nu
                 let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("swing_\(Int(Date().timeIntervalSince1970)).mov")
+                    .appendingPathComponent("rec_\(Int(Date().timeIntervalSince1970)).mov")
                 self.movieOutput.startRecording(to: url, recordingDelegate: self)
             }
         }
     }
 
-    // MARK: Framing-beregning (kaldes efter pose/motion — altid på main-tråden)
+    // MARK: Framing
     func recomputeFraming() {
         guard !pose.isEmpty else {
-            bodyInFrame = false; distanceOK = false; distanceHint = ""; angleMatches = false
+            bodyInFrame = false; distanceOK = false; distanceHint = ""; clubHeadroom = false; angleMatches = false
             return
         }
         let xs = pose.values.map { $0.x }, ys = pose.values.map { $0.y }
@@ -445,15 +595,15 @@ final class CameraManager: NSObject, ObservableObject {
 
         let hasHead = pose[.nose] != nil || pose[.neck] != nil
         let hasFeet = pose[.leftAnkle] != nil || pose[.rightAnkle] != nil
-        bodyInFrame = hasHead && hasFeet &&
-            minX > 0.03 && maxX < 0.97 && minY > 0.02 && maxY < 0.98
+        bodyInFrame = hasHead && hasFeet && minX > 0.03 && maxX < 0.97 && minY > 0.02 && maxY < 0.98
 
         let height = maxY - minY
-        if height < 0.55 { distanceOK = false; distanceHint = "Træd tættere på" }
-        else if height > 0.92 { distanceOK = false; distanceHint = "Træd tilbage" }
+        if height < 0.42 { distanceOK = false; distanceHint = "Træd tættere på" }
+        else if height > 0.72 { distanceOK = false; distanceHint = "Træd tilbage" }
         else { distanceOK = true; distanceHint = "" }
 
-        // Vinkel fra skulderbredde relativt til kropshøjde
+        clubHeadroom = minY > 0.12          // luft over hovedet til køllen i toppen
+
         if let ls = pose[.leftShoulder], let rs = pose[.rightShoulder], height > 0.01 {
             let ratio = abs(ls.x - rs.x) / height
             if ratio > 0.28 { detectedAngle = "Face-on" }
@@ -466,27 +616,22 @@ final class CameraManager: NSObject, ObservableObject {
     private func setStatus(_ text: String) { Task { @MainActor in self.statusText = text } }
 }
 
-// MARK: - Sample-buffer-delegate (video-pose + lyd)
+// MARK: - Sample-buffer-delegate
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
                          AVCaptureAudioDataOutputSampleBufferDelegate {
 
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        if output === videoDataOutput {
-            processVideo(sampleBuffer)
-        } else if output === audioDataOutput {
-            processAudio(sampleBuffer)
-        }
+        if output === videoDataOutput { processVideo(sampleBuffer) }
+        else if output === audioDataOutput { processAudio(sampleBuffer) }
     }
 
     private func processVideo(_ sampleBuffer: CMSampleBuffer) {
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastPoseTime > 0.04 else { return }   // ~25 Hz
+        guard now - lastPoseTime > 0.04 else { return }
         lastPoseTime = now
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
                                             orientation: visionOrientation, options: [:])
         do {
@@ -499,7 +644,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
             var result: PoseDict = [:]
             var confSum: Float = 0, count = 0
             for (name, pt) in pts where pt.confidence > 0.3 {
-                result[name] = CGPoint(x: pt.location.x, y: 1 - pt.location.y)  // → top-venstre
+                result[name] = CGPoint(x: pt.location.x, y: 1 - pt.location.y)
                 confSum += pt.confidence; count += 1
             }
             let avg = count > 0 ? confSum / Float(count) : 0
@@ -510,29 +655,24 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
                     : "Pose: ingen person"
                 self.recomputeFraming()
             }
-        } catch {
-            // stille – pose fejler bare på enkeltframes
-        }
+        } catch { }
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
         let peak = audioPeak(sampleBuffer)
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastAudioUI > 0.05 else { return }     // ~20 Hz UI
+        guard now - lastAudioUI > 0.05 else { return }
         lastAudioUI = now
         Task { @MainActor in
             self.audioLevel = peak
-            if peak > 0.5 {                                // impact-tærskel (tuning)
+            if peak > 0.5 {
                 self.impactFlash = true
-                Task {
-                    try? await Task.sleep(nanoseconds: 150_000_000)
-                    await MainActor.run { self.impactFlash = false }
-                }
+                Task { try? await Task.sleep(nanoseconds: 150_000_000)
+                       await MainActor.run { self.impactFlash = false } }
             }
         }
     }
 
-    /// Peak-amplitude fra en lyd-buffer. Håndterer Float32 + Int16.
     private func audioPeak(_ sampleBuffer: CMSampleBuffer) -> Float {
         guard let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return 0 }
@@ -543,14 +683,10 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
         var blockBuffer: CMBlockBuffer?
         var abl = AudioBufferList()
         let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &abl,
+            sampleBuffer, bufferListSizeNeededOut: nil, bufferListOut: &abl,
             bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer)
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
+            flags: 0, blockBufferOut: &blockBuffer)
         guard status == noErr else { return 0 }
 
         var peak: Float = 0
@@ -569,7 +705,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
     }
 }
 
-// MARK: - Optage-delegate (fil)
+// MARK: - Optage-delegate (gem app-privat)
 
 extension CameraManager: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL,
@@ -579,18 +715,19 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
 
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection], error: Error?) {
-        Task { @MainActor in self.isRecording = false }
-        // Gemmes i Fotos under de-risk (kan granskes bagefter). Skiftes til app-privat
-        // lager + auto-trim når rolling-buffer bygges (beslutning 2026-07-03).
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized else {
-                self.setStatus("Foto-adgang nægtet – klip i temp-mappe"); return
+        let view = recordingView
+        let dest = ClipStore.newURL(view: view)
+        do {
+            try FileManager.default.moveItem(at: outputFileURL, to: dest)
+            Task { @MainActor in
+                self.isRecording = false
+                self.statusText = "Gemt ✓ (\(view.rawValue), \(Int(self.activeFPS)) fps)"
+                self.onClipSaved?()
             }
-            PHPhotoLibrary.shared().performChanges {
-                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: outputFileURL, options: nil)
-            } completionHandler: { success, err in
-                if success { self.setStatus("Gemt i Fotos ✓ (\(Int(self.activeFPS)) fps @ \(self.activeResolution))") }
-                else { self.setStatus("Fejl ved gem: \(err?.localizedDescription ?? "ukendt")") }
+        } catch {
+            Task { @MainActor in
+                self.isRecording = false
+                self.statusText = "Fejl ved gem: \(error.localizedDescription)"
             }
         }
     }
