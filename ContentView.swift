@@ -66,6 +66,8 @@ final class ClipStore: ObservableObject {
         return dir
     }()
 
+    static let maxClips = 80     // auto-loft: behold nyeste N, slet ældste
+
     /// Filnavn: swing_<ts>_<viewKey>_<impactMs|na>.mov
     static func newURL(view: SwingView, impactMs: Int?) -> URL {
         let ts = Int(Date().timeIntervalSince1970)
@@ -85,12 +87,25 @@ final class ClipStore: ObservableObject {
             if parts.count >= 4, let ms = Double(parts[3]) { impact = ms / 1000 }
             result.append(Clip(url: url, view: view, date: Date(timeIntervalSince1970: ts), impact: impact))
         }
-        clips = result.sorted { $0.date > $1.date }
+        let sorted = result.sorted { $0.date > $1.date }
+        // Auto-loft: slet ældste ud over maxClips
+        if sorted.count > Self.maxClips {
+            for c in sorted[Self.maxClips...] { removeFiles(c) }
+            clips = Array(sorted.prefix(Self.maxClips))
+        } else {
+            clips = sorted
+        }
     }
 
-    func delete(_ clip: Clip) {
+    private func removeFiles(_ clip: Clip) {
         try? FileManager.default.removeItem(at: clip.url)
         try? FileManager.default.removeItem(at: PoseAnalyzer.cacheURL(for: clip.url))
+    }
+
+    func delete(_ clip: Clip) { removeFiles(clip); reload() }
+
+    func deleteAll() {
+        for c in clips { removeFiles(c) }
         reload()
     }
 }
@@ -189,19 +204,19 @@ struct ContentView: View {
                             .padding(12).background(.black.opacity(0.55)).clipShape(Circle())
                     }
                     Spacer()
-                    Toggle(isOn: $camera.autoMode) { Text("Auto").font(.caption).foregroundStyle(.white) }
-                        .toggleStyle(.button).tint(.green)
+                    Toggle(isOn: $camera.autoMode) {
+                        Label("Auto", systemImage: "bolt.fill").font(.caption.weight(.bold))
+                    }
+                    .toggleStyle(.button).tint(.green)
                 }
+                if camera.autoListening { ListeningBadge() }
                 badge(camera.statusText)
                 badge(camera.poseInfo)
                 FramingChecklist(camera: camera).padding(.top, 4)
 
                 Spacer()
 
-                Picker("Vinkel", selection: $camera.selectedView) {
-                    ForEach(SwingView.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented).frame(width: 220).padding(.bottom, 6)
+                AngleChips(selected: $camera.selectedView).padding(.bottom, 6)
 
                 ZStack {
                     Button(action: { camera.toggleRecording() }) {
@@ -242,6 +257,41 @@ struct ContentView: View {
 
 #Preview { ContentView() }
 
+// MARK: - Vinkel-chips + lytter-badge
+
+struct AngleChips: View {
+    @Binding var selected: SwingView
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(SwingView.allCases, id: \.self) { v in
+                Button { selected = v } label: {
+                    Text(v.rawValue)
+                        .font(.subheadline.weight(.bold))
+                        .padding(.horizontal, 18).padding(.vertical, 9)
+                        .background(selected == v ? Color.green.opacity(0.85) : Color.black.opacity(0.5))
+                        .foregroundStyle(.white).clipShape(Capsule())
+                        .overlay(Capsule().stroke(selected == v ? Color.white : .clear, lineWidth: 1.5))
+                }
+            }
+        }
+    }
+}
+
+struct ListeningBadge: View {
+    @State private var pulse = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle().fill(.red).frame(width: 10, height: 10)
+                .scaleEffect(pulse ? 1.4 : 0.8).opacity(pulse ? 1 : 0.5)
+            Text("LYTTER – slå dit sving").font(.caption.weight(.bold)).foregroundStyle(.white)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(.red.opacity(0.35)).clipShape(Capsule())
+        .overlay(Capsule().stroke(.red, lineWidth: 1))
+        .onAppear { withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { pulse = true } }
+    }
+}
+
 // MARK: - Bibliotek
 
 struct LibraryView: View {
@@ -249,6 +299,7 @@ struct LibraryView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var filter: SwingView? = nil
     @State private var showSync = false
+    @State private var confirmDeleteAll = false
 
     private var filtered: [Clip] {
         guard let f = filter else { return store.clips }
@@ -265,12 +316,17 @@ struct LibraryView: View {
                 }
                 .pickerStyle(.segmented).padding()
 
-                Button {
-                    showSync = true
-                } label: {
-                    Label("Sammenlign DTL / Face-on", systemImage: "rectangle.split.2x1")
+                HStack {
+                    Button { showSync = true } label: {
+                        Label("Sammenlign", systemImage: "rectangle.split.2x1")
+                    }
+                    Spacer()
+                    Button(role: .destructive) { confirmDeleteAll = true } label: {
+                        Label("Slet alle", systemImage: "trash")
+                    }
+                    .disabled(store.clips.isEmpty)
                 }
-                .padding(.bottom, 8)
+                .padding(.horizontal).padding(.bottom, 8)
 
                 if filtered.isEmpty {
                     Spacer(); Text("Ingen sving endnu").foregroundStyle(.secondary); Spacer()
@@ -284,7 +340,14 @@ struct LibraryView: View {
                 }
             }
             .navigationTitle("Seneste sving")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Luk") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Luk") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) { EditButton() }
+            }
+            .confirmationDialog("Slet alle sving?", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
+                Button("Slet alle", role: .destructive) { store.deleteAll() }
+                Button("Annuller", role: .cancel) {}
+            }
             .sheet(isPresented: $showSync) { SyncReviewView(store: store) }
         }
         .onAppear { store.reload() }
@@ -388,6 +451,7 @@ struct SyncReviewView: View {
     @State private var face: Clip?
     @State private var playerA = AVPlayer()
     @State private var playerB = AVPlayer()
+    @State private var scrub: Double = 0
 
     private var dtlClips: [Clip] { store.clips.filter { $0.view == .dtl } }
     private var faceClips: [Clip] { store.clips.filter { $0.view == .faceOn } }
@@ -400,12 +464,23 @@ struct SyncReviewView: View {
                     clipColumn(title: "DTL", clips: dtlClips, selection: $dtl, player: playerA)
                 }
 
-                Button {
-                    playSynced()
-                } label: {
-                    Label("Afspil synkront (justeret på impact)", systemImage: "play.rectangle.on.rectangle")
+                VStack(spacing: 12) {
+                    HStack(spacing: 34) {
+                        Button { scrub = -1.5; seekBoth(to: -1.5) } label: {
+                            Image(systemName: "backward.end.fill").font(.title2)
+                        }
+                        Button { playSynced() } label: { Image(systemName: "play.fill").font(.largeTitle) }
+                        Button { pauseBoth() } label: { Image(systemName: "pause.fill").font(.title) }
+                    }
+                    HStack(spacing: 8) {
+                        Text("−1,5s").font(.caption2).foregroundStyle(.secondary)
+                        Slider(value: $scrub, in: -1.5...1.5)
+                            .onChange(of: scrub) { _, v in pauseBoth(); seekBoth(to: v) }
+                        Text("+1,5s").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text("Ét sæt kontroller styrer begge videoer, synkroniseret på impact.")
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
-                .buttonStyle(.borderedProminent)
                 .disabled(dtl == nil || face == nil)
                 .padding()
             }
@@ -435,15 +510,17 @@ struct SyncReviewView: View {
         }
     }
 
-    /// Sæt begge klip 1.5s før deres impact og afspil samtidig → de rammer bolden synkront.
-    private func playSynced() {
-        let lead = 1.5
-        func seek(_ player: AVPlayer, _ clip: Clip?) {
-            let impact = clip?.impact ?? lead
-            let start = max(0, impact - lead)
-            player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
+    /// Søg begge klip til (impact + offset) → de holdes synkrone på impact-øjeblikket.
+    private func seekBoth(to offset: Double) {
+        func s(_ player: AVPlayer, _ clip: Clip?) {
+            let impact = clip?.impact ?? 1.5
+            player.seek(to: CMTime(seconds: max(0, impact + offset), preferredTimescale: 600))
         }
-        seek(playerA, dtl); seek(playerB, face)
+        s(playerA, dtl); s(playerB, face)
+    }
+    private func pauseBoth() { playerA.pause(); playerB.pause() }
+    private func playSynced() {
+        seekBoth(to: -1.5)
         playerA.play(); playerB.play()
     }
 }
@@ -548,7 +625,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var activeResolution = ""
     @Published var isFrontCamera = true
     @Published var videoPortraitSize = CGSize(width: 1080, height: 1920)
-    @Published var autoMode = false
+    @Published var autoMode = true { didSet { if oldValue != autoMode { autoModeChanged() } } }
+    @Published var autoListening = false
 
     @Published var pose: PoseDict = [:]
     @Published var poseInfo = "Pose: —"
@@ -585,6 +663,8 @@ final class CameraManager: NSObject, ObservableObject {
     private var recordingView: SwingView = .faceOn
     private var recordingIsAuto = false
     private var impactSeconds: Double? = nil     // impact-tid i den aktuelle optagelse
+    private var armGeneration = 0
+    private var suppressRearm = false
 
     private var startPosition: AVCaptureDevice.Position { isFrontCamera ? .front : .back }
     private var visionOrientation: CGImagePropertyOrientation { isFrontCamera ? .leftMirrored : .right }
@@ -628,6 +708,7 @@ final class CameraManager: NSObject, ObservableObject {
         session.commitConfiguration()
         if let device = videoDeviceInput?.device { configureHighFrameRate(device: device) }
         session.startRunning()
+        if autoMode { armInternal() }   // håndfri: start med at lytte med det samme
     }
 
     private func addVideoInput(position: AVCaptureDevice.Position) -> Bool {
@@ -707,22 +788,68 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: Optagelse (manuel + auto)
+    // MARK: Optagelse (manuel + håndfri auto)
+
+    /// Knappen: i auto = pause/genoptag lytning; i manuel = start/stop optagelse.
     func toggleRecording() {
-        let view = selectedView
-        let auto = autoMode
+        if autoMode {
+            sessionQueue.async {
+                if self.movieOutput.isRecording {
+                    self.suppressRearm = true
+                    self.movieOutput.stopRecording()      // pause (kasseres, re-armer ikke)
+                } else {
+                    self.armInternal()
+                }
+            }
+        } else {
+            let view = selectedView
+            sessionQueue.async {
+                if self.movieOutput.isRecording {
+                    self.movieOutput.stopRecording()
+                } else {
+                    self.recordingView = view
+                    self.recordingIsAuto = false
+                    self.impactSeconds = nil
+                    self.disableMirrorOnMovie()
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("rec_\(Int(Date().timeIntervalSince1970)).mov")
+                    self.movieOutput.startRecording(to: url, recordingDelegate: self)
+                }
+            }
+        }
+    }
+
+    func arm() { sessionQueue.async { self.armInternal() } }
+
+    private func autoModeChanged() {
         sessionQueue.async {
-            if self.movieOutput.isRecording {
+            if self.autoMode {
+                if !self.movieOutput.isRecording { self.armInternal() }
+            } else if self.movieOutput.isRecording {
+                self.suppressRearm = true
                 self.movieOutput.stopRecording()
-            } else {
-                self.recordingView = view
-                self.recordingIsAuto = auto
-                self.impactSeconds = nil
-                self.disableMirrorOnMovie()
-                let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("rec_\(Int(Date().timeIntervalSince1970)).mov")
-                self.movieOutput.startRecording(to: url, recordingDelegate: self)
-                if auto { self.setStatus("Auto: klar – sving når du er klar…") }
+            }
+        }
+    }
+
+    /// Arm håndfri optagelse: optag kontinuerligt, lyt efter impact, re-arm efter hvert sving.
+    private func armInternal() {
+        guard !movieOutput.isRecording else { return }
+        armGeneration += 1
+        let gen = armGeneration
+        recordingIsAuto = true
+        recordingView = selectedView
+        impactSeconds = nil
+        suppressRearm = false
+        disableMirrorOnMovie()
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rec_\(Int(Date().timeIntervalSince1970)).mov")
+        movieOutput.startRecording(to: url, recordingDelegate: self)
+        Task { @MainActor in self.autoListening = true; self.statusText = "LYTTER – slå dit sving" }
+        // Genbrug buffer hvis intet impact inden 30s (undgå kæmpe temp-fil)
+        sessionQueue.asyncAfter(deadline: .now() + 30) {
+            if gen == self.armGeneration, self.movieOutput.isRecording, self.impactSeconds == nil {
+                self.movieOutput.stopRecording()
             }
         }
     }
@@ -732,8 +859,7 @@ final class CameraManager: NSObject, ObservableObject {
         sessionQueue.async {
             guard self.recordingIsAuto, self.movieOutput.isRecording, self.impactSeconds == nil else { return }
             self.impactSeconds = CMTimeGetSeconds(self.movieOutput.recordedDuration)
-            self.setStatus("Impact! trimmer sving…")
-            // optag lidt efter impact, stop så
+            Task { @MainActor in self.autoListening = false; self.statusText = "Sving fanget – gemmer…" }
             self.sessionQueue.asyncAfter(deadline: .now() + 1.2) {
                 if self.movieOutput.isRecording { self.movieOutput.stopRecording() }
             }
@@ -862,11 +988,14 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
         Task { @MainActor in self.isRecording = false }
         let view = recordingView
         if recordingIsAuto, let impact = impactSeconds {
-            trimAndSave(src: outputFileURL, view: view, impact: impact)
+            trimAndSave(src: outputFileURL, view: view, impact: impact)   // re-armer i completion
         } else if recordingIsAuto {
-            // Auto men ingen impact hørt → kassér
+            // Auto uden impact (timeout eller bruger satte på pause) → kassér
             try? FileManager.default.removeItem(at: outputFileURL)
-            setStatus("Auto: intet impact hørt – prøv igen")
+            let shouldRearm = autoMode && !suppressRearm
+            suppressRearm = false
+            if shouldRearm { arm() }
+            else { Task { @MainActor in self.autoListening = false; self.statusText = "Auto på pause – tryk for at lytte" } }
         } else {
             let dest = ClipStore.newURL(view: view, impactMs: nil)
             try? FileManager.default.moveItem(at: outputFileURL, to: dest)
@@ -878,7 +1007,7 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
     private func trimAndSave(src: URL, view: SwingView, impact: Double) {
         let asset = AVURLAsset(url: src)
         let total = CMTimeGetSeconds(asset.duration)
-        let start = max(0, impact - 2.0)
+        let start = max(0, impact - 2.2)      // lidt mere optakt (0,2s tidligere)
         let end = min(total, impact + 1.2)
         let impactMs = Int((impact - start) * 1000)
         let dest = ClipStore.newURL(view: view, impactMs: impactMs)
@@ -886,6 +1015,7 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
             try? FileManager.default.moveItem(at: src, to: dest)
             Task { @MainActor in self.statusText = "Gemt ✓"; self.onClipSaved?() }
+            if autoMode { arm() }
             return
         }
         export.outputURL = dest
@@ -902,6 +1032,7 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
                 }
                 self.onClipSaved?()
             }
+            if self.autoMode { self.arm() }     // re-arm til næste sving
         }
     }
 }
