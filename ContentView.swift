@@ -549,7 +549,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
             bufferListSize: MemoryLayout<AudioBufferList>.size,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
-            flags: [],
+            flags: 0,
             blockBufferOut: &blockBuffer)
         guard status == noErr else { return 0 }
 
