@@ -5,12 +5,18 @@
 //  ALT i én fil, så den kan erstatte den auto-genererede ContentView.swift
 //  direkte (ingen nye filer at tilføje i Xcode).
 //
-//  Optager i højest mulige fps (helst 240) med synkron lyd, gemmer klippet
-//  i Fotos, og viser den FAKTISKE fps + opløsning så vi kan bekræfte
+//  Optager i højest mulige fps med synkron lyd, gemmer klippet i Fotos, og
+//  viser den FAKTISKE fps + opløsning + hvilket kamera, så vi kan bekræfte
 //  hardwaren live på enheden.
+//
+//  KAMERA-VALG: FRONT (selfie) er default — så man kan se skærmen/framing
+//  mens man filmer sig selv solo. Frontkameraet topper typisk ved 1080p@120
+//  (bagkameraet kan 240). Flip-knappen skifter til bagkameraet når man vil
+//  have maks kvalitet.
 //
 
 import SwiftUI
+import Combine
 import AVFoundation
 import Photos
 
@@ -29,7 +35,7 @@ struct ContentView: View {
             }
 
             VStack {
-                // Status-badge: bekræfter fps/opløsning live
+                // Status-badge: bekræfter kamera + fps/opløsning live
                 Text(camera.statusText)
                     .font(.callout.weight(.semibold))
                     .padding(.horizontal, 14)
@@ -41,15 +47,33 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Optageknap (rød mens der optages)
-                Button(action: { camera.toggleRecording() }) {
-                    ZStack {
-                        Circle().stroke(.white, lineWidth: 4).frame(width: 84, height: 84)
-                        Circle().fill(camera.isRecording ? Color.red : Color.white)
-                            .frame(width: 70, height: 70)
+                // Bund-kontroller: optageknap centreret, flip-knap til højre
+                ZStack {
+                    // Optageknap (rød mens der optages)
+                    Button(action: { camera.toggleRecording() }) {
+                        ZStack {
+                            Circle().stroke(.white, lineWidth: 4).frame(width: 84, height: 84)
+                            Circle().fill(camera.isRecording ? Color.red : Color.white)
+                                .frame(width: 70, height: 70)
+                        }
+                    }
+                    .disabled(!camera.permissionGranted)
+
+                    // Flip-knap (skift front/bag) — deaktiveret under optagelse
+                    HStack {
+                        Spacer()
+                        Button(action: { camera.flipCamera() }) {
+                            Image(systemName: "arrow.triangle.2.circlepath.camera")
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(16)
+                                .background(.black.opacity(0.55))
+                                .clipShape(Circle())
+                        }
+                        .disabled(!camera.permissionGranted || camera.isRecording)
+                        .padding(.trailing, 32)
                     }
                 }
-                .disabled(!camera.permissionGranted)
                 .padding(.bottom, 44)
             }
         }
@@ -89,13 +113,18 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var statusText = "Anmoder om adgang…"
     @Published var activeFPS: Double = 0
     @Published var activeResolution = ""
+    @Published var isFrontCamera = true          // FRONT = default (solo-brug)
 
     let session = AVCaptureSession()
 
     private let movieOutput = AVCaptureMovieFileOutput()
     private let sessionQueue = DispatchQueue(label: "swingplane.camera.session")
+    private var videoDeviceInput: AVCaptureDeviceInput?
 
-    // Start: bed om adgang + konfigurer
+    private var startPosition: AVCaptureDevice.Position { isFrontCamera ? .front : .back }
+
+    // MARK: - Start
+
     func start() {
         Task {
             let cam = await AVCaptureDevice.requestAccess(for: .video)
@@ -109,77 +138,130 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Konfiguration
+
     private func configureSession() {
         session.beginConfiguration()
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                   for: .video, position: .back),
-              let videoInput = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(videoInput) else {
+        // 1) Video-input: front som default
+        guard addVideoInput(position: startPosition) else {
             session.commitConfiguration()
-            setStatus("Kunne ikke tilgå bagkameraet")
+            setStatus("Kunne ikke tilgå kameraet")
             return
         }
-        session.addInput(videoInput)
 
+        // 2) Audio-input (impact-lyd, synkron med video)
         if let audioDevice = AVCaptureDevice.default(for: .audio),
            let audioInput = try? AVCaptureDeviceInput(device: audioDevice),
            session.canAddInput(audioInput) {
             session.addInput(audioInput)
         }
 
+        // 3) Movie-output (video + lyd i én fil)
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
         }
+        applyNoMirroring()
 
         session.commitConfiguration()
-        configureHighFrameRate(device: device, desiredFPS: 240)
+
+        if let device = videoDeviceInput?.device {
+            configureHighFrameRate(device: device)
+        }
         session.startRunning()
     }
 
-    private func configureHighFrameRate(device: AVCaptureDevice, desiredFPS: Double) {
-        var best: (format: AVCaptureDevice.Format, fps: Double, width: Int32)?
+    /// Tilføjer video-input for en given kamera-position og husker det.
+    private func addVideoInput(position: AVCaptureDevice.Position) -> Bool {
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            return false
+        }
+        session.addInput(input)
+        videoDeviceInput = input
+        return true
+    }
 
-        for format in device.formats {
-            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            let maxRate = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-            let supportsDesired = maxRate >= desiredFPS
+    /// Ingen spejling i den GEMTE fil — bevar sand venstre/højre-geometri
+    /// (vigtigt for pose- og klubhoved-analyse på front-optagelser).
+    private func applyNoMirroring() {
+        if let c = movieOutput.connection(with: .video), c.isVideoMirroringSupported {
+            c.automaticallyAdjustsVideoMirroring = false
+            c.isVideoMirrored = false
+        }
+    }
 
-            if let cur = best {
-                let curSupports = cur.fps >= desiredFPS
-                if supportsDesired && !curSupports {
-                    best = (format, maxRate, dims.width)
-                } else if supportsDesired == curSupports,
-                          dims.width > cur.width ||
-                          (dims.width == cur.width && maxRate > cur.fps) {
-                    best = (format, maxRate, dims.width)
-                }
+    // MARK: - Kamera-skift (front/bag)
+
+    func flipCamera() {
+        sessionQueue.async {
+            guard let current = self.videoDeviceInput else { return }
+            let newPosition: AVCaptureDevice.Position = (current.device.position == .front) ? .back : .front
+
+            self.session.beginConfiguration()
+            self.session.removeInput(current)
+
+            if self.addVideoInput(position: newPosition) {
+                self.applyNoMirroring()
+                Task { @MainActor in self.isFrontCamera = (newPosition == .front) }
             } else {
-                best = (format, maxRate, dims.width)
+                // Rul tilbage hvis det nye kamera ikke kunne tilføjes
+                self.session.addInput(current)
+                self.videoDeviceInput = current
+            }
+            self.session.commitConfiguration()
+
+            if let device = self.videoDeviceInput?.device {
+                self.configureHighFrameRate(device: device)
             }
         }
+    }
 
-        guard let chosen = best else { return }
+    // MARK: - Format-valg (høj fps)
+
+    /// Vælger bedste format: foretræk 1080p+ (skarphed), derefter højest fps,
+    /// derefter størst opløsning. Låser fps fast (cap 240).
+    /// → Bag: typisk 1080p@240. Front: typisk 1080p@120 (ikke 4K@60).
+    private func configureHighFrameRate(device: AVCaptureDevice, cap: Double = 240) {
+        func maxRate(_ f: AVCaptureDevice.Format) -> Double {
+            f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+        }
+        func rank(_ f: AVCaptureDevice.Format) -> (Int, Double, Int32) {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let is1080plus = d.width >= 1920 ? 1 : 0     // 1080p eller bedre foretrækkes
+            return (is1080plus, maxRate(f), d.width)
+        }
+
+        guard let chosen = device.formats.max(by: { a, b in
+            let ra = rank(a), rb = rank(b)
+            if ra.0 != rb.0 { return ra.0 < rb.0 }
+            if ra.1 != rb.1 { return ra.1 < rb.1 }
+            return ra.2 < rb.2
+        }) else { return }
 
         do {
             try device.lockForConfiguration()
-            device.activeFormat = chosen.format
-            let fps = min(desiredFPS, chosen.fps)
+            device.activeFormat = chosen
+            let fps = min(cap, maxRate(chosen))
             let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
             device.unlockForConfiguration()
 
-            let dims = CMVideoFormatDescriptionGetDimensions(chosen.format.formatDescription)
+            let dims = CMVideoFormatDescriptionGetDimensions(chosen.formatDescription)
+            let cam = (device.position == .front) ? "Front" : "Bag"
             Task { @MainActor in
                 self.activeFPS = fps
                 self.activeResolution = "\(dims.width)×\(dims.height)"
-                self.statusText = "Klar – \(Int(fps)) fps @ \(dims.width)×\(dims.height)"
+                self.statusText = "\(cam) – \(Int(fps)) fps @ \(dims.width)×\(dims.height)"
             }
         } catch {
             setStatus("Kunne ikke sætte fps: \(error.localizedDescription)")
         }
     }
+
+    // MARK: - Optagelse
 
     func toggleRecording() {
         sessionQueue.async {
@@ -193,10 +275,14 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Hjælpere
+
     private func setStatus(_ text: String) {
         Task { @MainActor in self.statusText = text }
     }
 }
+
+// MARK: - Optage-delegate
 
 extension CameraManager: AVCaptureFileOutputRecordingDelegate {
 
@@ -215,6 +301,8 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
                     error: Error?) {
         Task { @MainActor in self.isRecording = false }
 
+        // Gemmes i Fotos under de-risk-fasen, så skarphed/fps kan granskes bagefter.
+        // (Skiftes til app-privat lager + auto-trim når rolling-buffer bygges, jf. beslutning 2026-07-03.)
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized else {
                 self.setStatus("Foto-adgang nægtet – klip ligger i app'ens temp-mappe")
