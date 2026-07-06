@@ -197,7 +197,7 @@ struct CameraScreen: View {
             PoseOverlay(pose: camera.pose, videoSize: camera.videoPortraitSize)
                 .allowsHitTesting(false).ignoresSafeArea()
 
-            FramingBox(inside: camera.insideBox, hint: camera.frameHint)
+            FramingBox(inside: camera.allChecksPass, hint: camera.frameHint)
                 .allowsHitTesting(false)
 
             HStack {
@@ -208,6 +208,13 @@ struct CameraScreen: View {
 
             VStack(spacing: 8) {
                 HStack {
+                    Button { showLibrary = true } label: {
+                        Label("My swings", systemImage: "square.stack.3d.up.fill")
+                            .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 16).padding(.vertical, 12)
+                            .background(.black.opacity(0.55)).clipShape(Capsule())
+                    }
+                    Spacer()
                     Menu {
                         Picker("Fokus", selection: $focusArea) {
                             ForEach(FocusArea.allCases) { Text($0.rawValue).tag($0) }
@@ -230,17 +237,15 @@ struct CameraScreen: View {
                             .font(.system(size: 20, weight: .semibold)).foregroundStyle(.white)
                             .padding(12).background(.black.opacity(0.55)).clipShape(Circle())
                     }
-                    Button { showLibrary = true } label: {
-                        Image(systemName: "square.stack.3d.up.fill")
-                            .font(.system(size: 20, weight: .semibold)).foregroundStyle(.white)
-                            .padding(12).background(.black.opacity(0.55)).clipShape(Circle())
-                    }
+                }
+                HStack {
                     Spacer()
                     Toggle(isOn: $camera.autoMode) {
-                        Label("Auto", systemImage: "bolt.fill").font(.caption.weight(.bold))
+                        Label("Range session", systemImage: "flag.fill").font(.caption.weight(.bold))
                     }
-                    .toggleStyle(.button).tint(.green)
+                    .toggleStyle(.button).tint(.spGold)
                 }
+                .padding(.top, 10)
                 if camera.autoListening { ListeningBadge() }
                 badge(camera.statusText)
                 badge(camera.poseInfo)
@@ -302,9 +307,9 @@ struct AngleChips: View {
                     Text(v.rawValue)
                         .font(.subheadline.weight(.bold))
                         .padding(.horizontal, 18).padding(.vertical, 9)
-                        .background(selected == v ? Color.green.opacity(0.85) : Color.black.opacity(0.5))
-                        .foregroundStyle(.white).clipShape(Capsule())
-                        .overlay(Capsule().stroke(selected == v ? Color.white : .clear, lineWidth: 1.5))
+                        .background(selected == v ? Color.spGold : Color.black.opacity(0.5))
+                        .foregroundStyle(selected == v ? Color.spInk : .white).clipShape(Capsule())
+                        .overlay(Capsule().stroke(selected == v ? Color.spGoldLight : .clear, lineWidth: 1.5))
                 }
             }
         }
@@ -396,6 +401,7 @@ struct LibraryView: View {
 struct ClipRow: View {
     let clip: Clip
     var number: Int = 0
+    @State private var durationText = ""
     private static let fmt: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "d. MMM HH:mm"; return f
     }()
@@ -407,8 +413,11 @@ struct ClipRow: View {
                 Text("Sving \(number)").font(.body.weight(.semibold))
                 HStack(spacing: 6) {
                     Image(systemName: clip.view == .dtl ? "figure.golf" : "person.fill")
-                        .font(.caption2).foregroundStyle(.green)
+                        .font(.caption2).foregroundStyle(Color.spGold)
                     Text(clip.view.rawValue).font(.caption).foregroundStyle(.secondary)
+                    if !durationText.isEmpty {
+                        Text("· \(durationText)").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Text(Self.fmt.string(from: clip.date)).font(.caption2).foregroundStyle(.secondary)
             }
@@ -416,6 +425,11 @@ struct ClipRow: View {
             Image(systemName: "play.circle").foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+        .task {
+            guard durationText.isEmpty else { return }
+            let sec = (try? await AVURLAsset(url: clip.url).load(.duration).seconds) ?? 0
+            if sec.isFinite && sec > 0 { durationText = String(format: "%.1f s", sec) }
+        }
     }
 }
 
@@ -516,6 +530,12 @@ struct ClipPlayerView: View {
         }
         .navigationTitle(clip.view.rawValue)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // Del klip (fx til OneDrive) -> analyse paa PC'en
+            ToolbarItem(placement: .primaryAction) {
+                ShareLink(item: clip.url) { Image(systemName: "square.and.arrow.up") }
+            }
+        }
     }
 }
 
@@ -719,9 +739,12 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var angleMatches = false
     @Published var selectedView: SwingView = .faceOn { didSet { recomputeFraming() } }
     var framingReady: Bool { isLevel && bodyInFrame && distanceOK && clubHeadroom && angleMatches }
+    var allChecksPass: Bool { framingReady && centered }
     var insideBox: Bool { bodyInFrame && distanceOK && clubHeadroom && centered }
     var frameHint: String {
         if !bodyInFrame { return "Få hele kroppen i billedet" }
+        if !isLevel { return "Sæt telefonen i vater" }
+        if !angleMatches { return "Vinklen ligner ikke \(selectedView.rawValue)" }
         if !centered { return "Stil dig i midten" }
         if !distanceOK { return distanceHint }
         if !clubHeadroom { return "Plads til køllen over hovedet" }
@@ -1160,9 +1183,16 @@ enum TrainingMode: String, CaseIterable, Identifiable {
 
 private enum FlowStep { case start, angle, camera }
 
-// Farver fra design-mockuppet
+// Farver fra Plane-mockuppet ("Plane mockup.html": moerkegroen + guld) + diagram-farver
 private extension Color {
-    static let spTeal   = Color(red: 0.62, green: 0.88, blue: 0.80) // #9fe1cb
+    static let spBgTop   = Color(red: 0.110, green: 0.200, blue: 0.145) // #1c3325
+    static let spBg      = Color(red: 0.039, green: 0.110, blue: 0.071) // #0a1c12
+    static let spBgDeep  = Color(red: 0.020, green: 0.051, blue: 0.031) // #050d08
+    static let spSurface = Color(red: 0.078, green: 0.208, blue: 0.165) // #14352a
+    static let spGold    = Color(red: 0.831, green: 0.686, blue: 0.216) // #d4af37
+    static let spGoldLight = Color(red: 0.941, green: 0.780, blue: 0.369) // #f0c75e
+    static let spInk     = Color(red: 0.102, green: 0.102, blue: 0.039) // #1a1a0a
+    static let spCream   = Color(red: 0.961, green: 0.945, blue: 0.902) // #f5f1e6
     static let spPurple = Color(red: 0.50, green: 0.47, blue: 0.87) // #7f77dd
     static let spAmber  = Color(red: 0.73, green: 0.46, blue: 0.09) // #ba7517
     static let spPurpleDark = Color(red: 0.235, green: 0.204, blue: 0.537) // #3c3489
@@ -1171,9 +1201,8 @@ private extension Color {
 
 private struct FlowBackground: View {
     var body: some View {
-        LinearGradient(colors: [Color(red: 0.09, green: 0.09, blue: 0.10),
-                                Color(red: 0.05, green: 0.05, blue: 0.06)],
-                       startPoint: .top, endPoint: .bottom)
+        RadialGradient(colors: [Color.spBgTop, Color.spBg, Color.spBgDeep],
+                       center: .top, startRadius: 0, endRadius: 900)
             .ignoresSafeArea()
     }
 }
@@ -1228,7 +1257,7 @@ struct OnboardingView: View {
         Button(action: action) {
             HStack(spacing: 14) {
                 Image(systemName: icon).font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(Color.spTeal).frame(width: 40)
+                    .foregroundStyle(Color.spGold).frame(width: 40)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.headline).foregroundStyle(.white)
                     Text(sub).font(.subheadline).foregroundStyle(.white.opacity(0.6))
@@ -1238,9 +1267,9 @@ struct OnboardingView: View {
                 Image(systemName: "chevron.right").foregroundStyle(.white.opacity(0.3))
             }
             .padding(16)
-            .background(Color.white.opacity(0.08))
+            .background(Color.spSurface)
             .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.spGold.opacity(0.25), lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -1279,9 +1308,9 @@ struct AngleSelectView: View {
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.08))
+            .background(Color.spSurface)
             .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.spGold.opacity(0.25), lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -1311,7 +1340,8 @@ struct FramingBox: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 18)
                     .stroke(inside ? Color.green : Color.red,
-                            style: StrokeStyle(lineWidth: 3, lineJoin: .round, dash: inside ? [] : [12, 8]))
+                            style: StrokeStyle(lineWidth: 5, lineJoin: .round, dash: inside ? [] : [12, 8]))
+                    .shadow(color: (inside ? Color.green : Color.red).opacity(0.8), radius: 10)
                     .frame(width: bw, height: bh)
                     .position(x: cx, y: cy)
                 if !inside && !hint.isEmpty {
