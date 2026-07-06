@@ -731,6 +731,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var audioLevel: Float = 0
     @Published var impactFlash = false
     @Published var windSensitivity: WindSensitivity = .normal
+    var noiseFloor: Float = 0.02
+    var lastImpactAt: Double = 0
 
     var onClipSaved: (() -> Void)?
 
@@ -1040,8 +1042,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
     // markant over et GLIDENDE baggrundsniveau OG over et absolut gulv. Vindstød er
     // vedvarende → de hæver baggrunden og rammer derfor ikke ratio-kravet; et golfslag
     // er en kort, kraftig transient → passerer. Debounce 0,6s mod dobbelt-trig.
-    private var noiseFloor: Float = 0.02
-    private var lastImpactAt: Double = 0
     private func detectImpact(_ peak: Float) -> Bool {
         let now = CFAbsoluteTimeGetCurrent()
         let ratio = windSensitivity.ratio
