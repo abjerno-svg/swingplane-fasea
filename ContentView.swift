@@ -70,7 +70,7 @@ enum ClubAnalyzer {
     static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
         let cacheURL = cacheURL(for: clipURL)
         if let data = try? Data(contentsOf: cacheURL),
-           let cache = try? JSONDecoder().decode(ClubCache.self, from: data) {
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 3 {
             completion(cache); return
         }
         guard let model = model else { completion(nil); return }
@@ -94,7 +94,7 @@ enum ClubAnalyzer {
                 }
                 t += step
             }
-            let cache = ClubCache(v: 2, width: w, height: h, frames: frames)
+            let cache = ClubCache(v: 3, width: w, height: h, frames: frames)
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
         }
@@ -121,8 +121,12 @@ enum ClubAnalyzer {
                                       | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
         ctx.setFillColor(CGColor(red: 114/255, green: 114/255, blue: 114/255, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 640))
-        // CGContext har origo nederst-venstre; letterbox skal ligge i TOP-venstre.
-        ctx.draw(cg, in: CGRect(x: 0, y: 640 - sh, width: sw, height: sh))
+        // Standard-flip (CoreMLHelpers-opskriften): uden denne ligger billedet PAA HOVEDET
+        // i pixelbufferen -> alle y-koordinater spejlvendt (device-fund 2026-07-07:
+        // plane lines fra toppen af billedet). Efter flip: opret billede, top-venstre.
+        ctx.translateBy(x: 0, y: 640)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: sw, height: sh))
         guard let inp = try? MLDictionaryFeatureProvider(dictionary: ["images": MLFeatureValue(pixelBuffer: buf)]),
               let outp = try? model.prediction(from: inp),
               let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return nil }
@@ -163,6 +167,36 @@ enum ClubAnalyzer {
             if f.y < bestY { bestY = f.y; best = i }
         }
         return best
+    }
+}
+
+// MARK: - Baggrunds-analyse (pose + klubhoved koeres straks naar et klip er gemt,
+// saa toggles som regel er klar naar man aabner klippet). Serielt, nyeste foerst.
+
+enum BackgroundAnalyzer {
+    private static var running = false
+    private static var pending: [URL] = []
+
+    /// Kaldes fra ClipStore.reload() paa main. Saetter koen = klip der mangler cache.
+    static func ensure(_ clips: [Clip]) {
+        let fm = FileManager.default
+        pending = clips.map(\.url).filter { url in
+            !fm.fileExists(atPath: PoseAnalyzer.cacheURL(for: url).path)
+                || !fm.fileExists(atPath: ClubAnalyzer.cacheURL(for: url).path)
+        }
+        kick()
+    }
+
+    private static func kick() {
+        guard !running, !pending.isEmpty else { return }
+        running = true
+        let url = pending.removeFirst()
+        PoseAnalyzer.loadOrCompute(for: url) { _ in
+            ClubAnalyzer.loadOrCompute(for: url) { _ in
+                running = false
+                kick()
+            }
+        }
     }
 }
 
@@ -213,6 +247,7 @@ final class ClipStore: ObservableObject {
         } else {
             clips = sorted
         }
+        BackgroundAnalyzer.ensure(clips)
     }
 
     private func removeFiles(_ clip: Clip) {
@@ -603,8 +638,8 @@ struct SkeletonVideo: View {
     @State private var clubTopIdx = 0
     @State private var currentTime: Double = 0
     @State private var planeLines: [PlaneLine] = []
-    @AppStorage("showClubTrail") private var showClubTrail = true
-    @AppStorage("showPlaneLines") private var showPlaneLines = false
+    @State private var showClubTrail = false
+    @State private var showPlaneLines = false
 
     var body: some View {
         ZStack {
@@ -631,35 +666,51 @@ struct SkeletonVideo: View {
             }
             VStack {
                 Spacer()
+                HStack(spacing: 10) {
+                    Toggle(isOn: $showClubTrail) {
+                        Label(clubAnalyzing ? "Analyserer…" : "Klubhoved-spor",
+                              systemImage: clubAnalyzing ? "hourglass" : "scribble.variable")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .toggleStyle(.button).tint(.spGold)
+                    .disabled(clubAnalyzing || ClubAnalyzer.model == nil)
+                    if clip.view == .dtl {
+                        Toggle(isOn: $showPlaneLines) {
+                            Label((clubAnalyzing || analyzing) ? "Analyserer…" : "Plane lines",
+                                  systemImage: (clubAnalyzing || analyzing) ? "hourglass" : "line.diagonal")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .toggleStyle(.button).tint(.spGold)
+                        .disabled(clubAnalyzing || analyzing)
+                    }
+                }
                 Group {
                     if ClubAnalyzer.model == nil {
                         Text("Klubhoved: model mangler i bygget")
-                    } else if clubAnalyzing {
-                        Text("Analyserer klubhoved…")
-                    } else {
+                    } else if !clubAnalyzing {
                         Text("Klubhoved: \(clubCache?.frames.count ?? 0) punkter")
                     }
                 }
                 .font(.caption2).foregroundStyle(.white.opacity(0.75))
                 .padding(.horizontal, 8).padding(.vertical, 3)
                 .background(.black.opacity(0.45)).clipShape(Capsule())
+                .allowsHitTesting(false)
                 .padding(.bottom, 6)
             }
-            .allowsHitTesting(false)
         }
         .onAppear {
             player.replaceCurrentItem(with: AVPlayerItem(url: clip.url))
+            let obs = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.03, preferredTimescale: 600), queue: .main) { time in
+                let t = CMTimeGetSeconds(time)
+                self.currentTime = t
+                if let cache = self.cache {
+                    self.currentPose = PoseAnalyzer.pose(at: t, in: cache)
+                }
+            }
+            self.observer = obs
             PoseAnalyzer.loadOrCompute(for: clip.url) { c in
                 self.cache = c; self.analyzing = false
-                let obs = player.addPeriodicTimeObserver(
-                    forInterval: CMTime(seconds: 0.03, preferredTimescale: 600), queue: .main) { time in
-                    let t = CMTimeGetSeconds(time)
-                    self.currentTime = t
-                    if let cache = self.cache {
-                        self.currentPose = PoseAnalyzer.pose(at: t, in: cache)
-                    }
-                }
-                self.observer = obs
                 self.computePlaneLines()
             }
             ClubAnalyzer.loadOrCompute(for: clip.url) { cc in
@@ -714,7 +765,6 @@ struct ClipPlayerView: View {
                 Button { player.play() } label: { Image(systemName: "play.fill").font(.title) }
                 Button { player.pause() } label: { Image(systemName: "pause.fill").font(.title2) }
             }.padding()
-            OverlayToggles()
             Spacer()
         }
         .navigationTitle(clip.view.rawValue)
@@ -723,28 +773,6 @@ struct ClipPlayerView: View {
             // Del klip (fx til OneDrive) -> analyse paa PC'en
             ToolbarItem(placement: .primaryAction) {
                 ShareLink(item: clip.url) { Image(systemName: "square.and.arrow.up") }
-            }
-        }
-    }
-}
-
-// MARK: - Overlay-toggles (trail + plane, huskes via AppStorage)
-
-struct OverlayToggles: View {
-    @AppStorage("showClubTrail") private var showClubTrail = true
-    @AppStorage("showPlaneLines") private var showPlaneLines = false
-    var body: some View {
-        HStack(spacing: 10) {
-            Toggle(isOn: $showClubTrail) {
-                Label("Klubhoved-spor", systemImage: "scribble.variable").font(.caption.weight(.semibold))
-            }
-            .toggleStyle(.button).tint(.spGold)
-            Toggle(isOn: $showPlaneLines) {
-                Label("Plane lines", systemImage: "line.diagonal").font(.caption.weight(.semibold))
-            }
-            .toggleStyle(.button).tint(.spGold)
-            if ClubAnalyzer.model == nil {
-                Text("Model mangler i bygget").font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -906,7 +934,8 @@ struct ClubTrailOverlay: View {
             func p(_ f: ClubFrame) -> CGPoint {
                 CGPoint(x: ox + f.x * dispW, y: oy + f.y * dispH)
             }
-            let pts = cache.frames.enumerated().filter { $0.element.t <= upTo }
+            let cutoff = upTo <= 0.05 ? Double.greatestFiniteMagnitude : upTo
+            let pts = cache.frames.enumerated().filter { $0.element.t <= cutoff }
             guard pts.count > 1 else { return }
             func stroke(_ seg: [CGPoint], _ color: Color) {
                 guard seg.count > 1 else { return }
@@ -1602,6 +1631,9 @@ struct OnboardingView: View {
                 .buttonStyle(.plain)
                 .padding(.top, 6)
                 Spacer()
+                Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") · Build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
+                    .font(.caption2).foregroundStyle(.white.opacity(0.35))
+                    .padding(.bottom, 4)
             }
             .padding(.horizontal, 24)
             .sheet(isPresented: $showTutorial) { TutorialView() }
