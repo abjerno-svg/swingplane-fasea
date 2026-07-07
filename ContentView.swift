@@ -600,12 +600,35 @@ struct SyncReviewView: View {
             }
             Menu {
                 ForEach(clips) { c in
-                    Button(ClipRow.dateString(c.date)) { selection.wrappedValue = c }
+                    Button { selection.wrappedValue = c } label: {
+                        Label {
+                            Text("Sving \(swingNumber(c)) · \(ClipRow.dateString(c.date))")
+                        } icon: {
+                            if let ui = cachedThumb(c) {
+                                Image(uiImage: ui)
+                            } else {
+                                Image(systemName: c.view == .dtl ? "figure.golf" : "person.fill")
+                            }
+                        }
+                    }
                 }
             } label: {
-                Text(selection.wrappedValue == nil ? "Vælg \(title)" : title).font(.caption)
+                Text(selection.wrappedValue.map { "Sving \(swingNumber($0)) · \(title)" } ?? "Vælg \(title)")
+                    .font(.caption)
             }
         }
+    }
+
+    /// Samme logiske nummerering som i biblioteket (kronologisk).
+    private func swingNumber(_ clip: Clip) -> Int {
+        let ordered = store.clips.sorted { $0.date < $1.date }
+        return (ordered.firstIndex { $0.id == clip.id } ?? 0) + 1
+    }
+    /// Thumbnail fra bibliotekets cache (.thumb.jpg-sidefil); nedskaleret til menu-ikon.
+    private func cachedThumb(_ clip: Clip) -> UIImage? {
+        let thumb = clip.url.deletingPathExtension().appendingPathExtension("thumb.jpg")
+        guard let data = try? Data(contentsOf: thumb), let ui = UIImage(data: data) else { return nil }
+        return ui.preparingThumbnail(of: CGSize(width: 44, height: 60)) ?? ui
     }
 
     /// Søg begge klip til (impact + offset) → de holdes synkrone på impact-øjeblikket.
@@ -876,6 +899,13 @@ final class CameraManager: NSObject, ObservableObject {
             let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
             device.activeVideoMinFrameDuration = dur
             device.activeVideoMaxFrameDuration = dur
+            // Frys koellen: loft over lukketiden (maks 1/1000s). Autoeksponering
+            // koerer stadig og kompenserer med ISO — men maa aldrig vaelge lang
+            // lukketid i graavejr (= motion blur = klubhoved-detektion doer).
+            let maxShutter = CMTime(value: 1, timescale: 1000)
+            if device.activeFormat.minExposureDuration <= maxShutter {
+                device.activeMaxExposureDuration = maxShutter
+            }
             device.unlockForConfiguration()
             let dims = CMVideoFormatDescriptionGetDimensions(chosen.formatDescription)
             let cam = (device.position == .front) ? "Front" : "Bag"
