@@ -127,14 +127,31 @@ enum ClubAnalyzer {
               let outp = try? model.prediction(from: inp),
               let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return nil }
         let n = 8400
-        let ptr = UnsafeMutablePointer<Float>(OpaquePointer(arr.dataPointer))
+        let count = arr.count
+        guard count >= 7 * n else { return nil }
+        // Outputtet kan vaere fp16 (konverteret med FLOAT16) — laes efter faktisk datatype,
+        // ellers laeses ud over bufferen (SIGSEGV, crash-log 2026-07-07).
+        var vals = [Float](repeating: 0, count: 7 * n)
+        switch arr.dataType {
+        case .float32:
+            let p = arr.dataPointer.bindMemory(to: Float.self, capacity: count)
+            for i in 0..<(7 * n) { vals[i] = p[i] }
+        case .float16:
+            let p = arr.dataPointer.bindMemory(to: Float16.self, capacity: count)
+            for i in 0..<(7 * n) { vals[i] = Float(p[i]) }
+        case .double:
+            let p = arr.dataPointer.bindMemory(to: Double.self, capacity: count)
+            for i in 0..<(7 * n) { vals[i] = Float(p[i]) }
+        default:
+            return nil
+        }
         var bestC: Float = 0; var bestI = -1
         for i in 0..<n {
-            let c = max(ptr[4*n + i], max(ptr[5*n + i], ptr[6*n + i]))
+            let c = max(vals[4*n + i], max(vals[5*n + i], vals[6*n + i]))
             if c > bestC { bestC = c; bestI = i }
         }
         guard bestC > 0.35, bestI >= 0 else { return nil }
-        let cx = Double(ptr[bestI]), cy = Double(ptr[n + bestI])
+        let cx = Double(vals[bestI]), cy = Double(vals[n + bestI])
         return (x: (cx / sc) / Double(W), y: (cy / sc) / Double(H), c: Double(bestC))
     }
 
