@@ -18,6 +18,7 @@ import AVKit
 import UIKit
 import Vision
 import CoreMotion
+import CoreML
 
 typealias PoseDict = [VNHumanBodyPoseObservation.JointName: CGPoint]
 
@@ -32,6 +33,8 @@ enum SwingView: String, CaseIterable {
 
 struct PoseFrame: Codable { let t: Double; let joints: [String: [Double]] }
 struct PoseCache: Codable { let width: Double; let height: Double; let frames: [PoseFrame] }
+struct ClubFrame: Codable { let t: Double; let x: Double; let y: Double; let c: Double }
+struct ClubCache: Codable { let width: Double; let height: Double; let frames: [ClubFrame] }
 
 enum PoseKeys {
     static let map: [(VNHumanBodyPoseObservation.JointName, String)] = [
@@ -48,6 +51,103 @@ enum PoseKeys {
 }
 
 // MARK: - Klip-model + lager
+
+// MARK: - Klubhoved-analyse (Core ML, en gang pr. klip, cache som sidefil)
+// Kraever SwingClub.mlpackage i app-bundlet (konverteret fra best_v3.onnx).
+// Mangler modellen, degraderer den paent: ingen trail, ingen crash.
+
+enum ClubAnalyzer {
+    static func cacheURL(for clipURL: URL) -> URL {
+        clipURL.appendingPathExtension("club.json")
+    }
+
+    static var model: MLModel? = {
+        guard let url = Bundle.main.url(forResource: "SwingClub", withExtension: "mlmodelc") else { return nil }
+        let cfg = MLModelConfiguration(); cfg.computeUnits = .all
+        return try? MLModel(contentsOf: url, configuration: cfg)
+    }()
+
+    static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
+        let cacheURL = cacheURL(for: clipURL)
+        if let data = try? Data(contentsOf: cacheURL),
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data) {
+            completion(cache); return
+        }
+        guard let model = model else { completion(nil); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let asset = AVURLAsset(url: clipURL)
+            let dur = CMTimeGetSeconds(asset.duration)
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.appliesPreferredTrackTransform = true
+            gen.requestedTimeToleranceBefore = .zero
+            gen.requestedTimeToleranceAfter = .zero
+            var frames: [ClubFrame] = []
+            var w = 1080.0, h = 1920.0
+            let step = 1.0 / 60.0     // taettere end pose: trail skal vaere glat
+            var t = 0.0
+            while t < max(dur, 0.01) {
+                if let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) {
+                    w = Double(cg.width); h = Double(cg.height)
+                    if let det = detect(cg: cg, model: model) {
+                        frames.append(ClubFrame(t: t, x: det.x, y: det.y, c: det.c))
+                    }
+                }
+                t += step
+            }
+            let cache = ClubCache(width: w, height: h, frames: frames)
+            if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
+            DispatchQueue.main.async { completion(cache) }
+        }
+    }
+
+    /// Letterbox 640x640 (top-venstre, som valideret i sandkassen), kor modellen,
+    /// dekod (1,7,8400): raekke 0-3 = cx,cy,w,h; raekke 4-6 = klasse-konfidenser.
+    private static func detect(cg: CGImage, model: MLModel) -> (x: Double, y: Double, c: Double)? {
+        let W = cg.width, H = cg.height
+        let sc = 640.0 / Double(max(W, H))
+        let sw = Int(Double(W) * sc), sh = Int(Double(H) * sc)
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferCGImageCompatibilityKey: true,
+                     kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary
+        CVPixelBufferCreate(kCFAllocatorDefault, 640, 640, kCVPixelFormatType_32BGRA, attrs, &pb)
+        guard let buf = pb else { return nil }
+        CVPixelBufferLockBaseAddress(buf, [])
+        defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+        guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buf),
+                                  width: 640, height: 640, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(red: 114/255, green: 114/255, blue: 114/255, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 640))
+        // CGContext har origo nederst-venstre; letterbox skal ligge i TOP-venstre.
+        ctx.draw(cg, in: CGRect(x: 0, y: 640 - sh, width: sw, height: sh))
+        guard let inp = try? MLDictionaryFeatureProvider(dictionary: ["images": MLFeatureValue(pixelBuffer: buf)]),
+              let outp = try? model.prediction(from: inp),
+              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return nil }
+        let n = 8400
+        let ptr = UnsafeMutablePointer<Float>(OpaquePointer(arr.dataPointer))
+        var bestC: Float = 0; var bestI = -1
+        for i in 0..<n {
+            let c = max(ptr[4*n + i], max(ptr[5*n + i], ptr[6*n + i]))
+            if c > bestC { bestC = c; bestI = i }
+        }
+        guard bestC > 0.35, bestI >= 0 else { return nil }
+        let cx = Double(ptr[bestI]), cy = Double(ptr[n + bestI])
+        return (x: (cx / sc) / Double(W), y: (cy / sc) / Double(H), c: Double(bestC))
+    }
+
+    /// Split-indeks til farveskift: toppen = hoejeste klubhoved-punkt FOER impact.
+    static func topIndex(in cache: ClubCache, impact: Double?) -> Int {
+        let cut = impact ?? (cache.frames.last?.t ?? 0) * 0.6
+        var best = 0; var bestY = 2.0
+        for (i, f) in cache.frames.enumerated() where f.t <= cut {
+            if f.y < bestY { bestY = f.y; best = i }
+        }
+        return best
+    }
+}
 
 struct Clip: Identifiable {
     let id = UUID()
@@ -101,6 +201,7 @@ final class ClipStore: ObservableObject {
     private func removeFiles(_ clip: Clip) {
         try? FileManager.default.removeItem(at: clip.url)
         try? FileManager.default.removeItem(at: PoseAnalyzer.cacheURL(for: clip.url))
+        try? FileManager.default.removeItem(at: ClubAnalyzer.cacheURL(for: clip.url))
         try? FileManager.default.removeItem(at: clip.url.deletingPathExtension().appendingPathExtension("thumb.jpg"))
     }
 
@@ -208,7 +309,7 @@ struct CameraScreen: View {
 
             VStack(spacing: 8) {
                 HStack {
-                    Button { showLibrary = true } label: {
+                    Button { camera.pauseListening(); showLibrary = true } label: {
                         Label("My swings", systemImage: "square.stack.3d.up.fill")
                             .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
                             .padding(.horizontal, 16).padding(.vertical, 12)
@@ -224,6 +325,9 @@ struct CameraScreen: View {
                         }
                         Picker("Følsomhed (blæst)", selection: $camera.windSensitivity) {
                             ForEach(WindSensitivity.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        Toggle(isOn: $camera.poseGateEnabled) {
+                            Label("Kun ved sving (pose-gate)", systemImage: "figure.golf")
                         }
                         Button { camera.flipCamera() } label: {
                             Label("Skift kamera", systemImage: "camera.rotate")
@@ -244,6 +348,8 @@ struct CameraScreen: View {
                         Label("Range session", systemImage: "flag.fill").font(.caption.weight(.bold))
                     }
                     .toggleStyle(.button).tint(.spGold)
+                    .buttonBorderShape(.capsule)
+                    .overlay(Capsule().stroke(Color.spGold, lineWidth: 1.5))
                 }
                 .padding(.top, 10)
                 if camera.autoListening { ListeningBadge() }
@@ -284,7 +390,7 @@ struct CameraScreen: View {
             camera.onClipSaved = { store.reload() }
             camera.start(); store.reload()
         }
-        .sheet(isPresented: $showLibrary) { LibraryView(store: store) }
+        .sheet(isPresented: $showLibrary, onDismiss: { camera.resumeListening() }) { LibraryView(store: store) }
     }
 
     private func badge(_ text: String) -> some View {
@@ -475,6 +581,12 @@ struct SkeletonVideo: View {
     @State private var currentPose: PoseDict = [:]
     @State private var analyzing = true
     @State private var observer: Any?
+    @State private var clubCache: ClubCache?
+    @State private var clubTopIdx = 0
+    @State private var currentTime: Double = 0
+    @State private var planeLines: [PlaneLine] = []
+    @AppStorage("showClubTrail") private var showClubTrail = true
+    @AppStorage("showPlaneLines") private var showPlaneLines = false
 
     var body: some View {
         ZStack {
@@ -483,6 +595,16 @@ struct SkeletonVideo: View {
                 PoseOverlay(pose: currentPose,
                             videoSize: CGSize(width: cache.width, height: cache.height),
                             fill: false)
+                    .allowsHitTesting(false)
+            }
+            if showPlaneLines, let cc = clubCache, !planeLines.isEmpty {
+                PlaneLinesOverlay(lines: planeLines,
+                                  videoSize: CGSize(width: cc.width, height: cc.height))
+                    .allowsHitTesting(false)
+            }
+            if showClubTrail, let cc = clubCache {
+                ClubTrailOverlay(cache: cc, upTo: currentTime, topIdx: clubTopIdx,
+                                 videoSize: CGSize(width: cc.width, height: cc.height))
                     .allowsHitTesting(false)
             }
             if analyzing {
@@ -496,17 +618,48 @@ struct SkeletonVideo: View {
                 self.cache = c; self.analyzing = false
                 let obs = player.addPeriodicTimeObserver(
                     forInterval: CMTime(seconds: 0.03, preferredTimescale: 600), queue: .main) { time in
+                    let t = CMTimeGetSeconds(time)
+                    self.currentTime = t
                     if let cache = self.cache {
-                        self.currentPose = PoseAnalyzer.pose(at: CMTimeGetSeconds(time), in: cache)
+                        self.currentPose = PoseAnalyzer.pose(at: t, in: cache)
                     }
                 }
                 self.observer = obs
+                self.computePlaneLines()
+            }
+            ClubAnalyzer.loadOrCompute(for: clip.url) { cc in
+                self.clubCache = cc
+                if let cc { self.clubTopIdx = ClubAnalyzer.topIndex(in: cc, impact: clip.impact) }
+                self.computePlaneLines()
             }
         }
         .onDisappear {
             if let observer { player.removeTimeObserver(observer) }
             player.pause()
         }
+    }
+
+    /// Address: bold = median af klubhoved i klippets foerste 0,4s.
+    /// Guld linje bold->hofte(midt), groen linje bold->trail-skulder. Statisk fra P1.
+    private func computePlaneLines() {
+        guard let cc = clubCache, let pc = cache else { return }
+        let early = cc.frames.filter { $0.t <= 0.4 }
+        guard !early.isEmpty else { return }
+        let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
+        let ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
+        let t0 = early[early.count / 2].t
+        let pose = PoseAnalyzer.pose(at: t0, in: pc)
+        var lines: [PlaneLine] = []
+        if let rh = pose[.rightHip], let lh = pose[.leftHip] {
+            let hip = CGPoint(x: (rh.x + lh.x) / 2, y: (rh.y + lh.y) / 2)
+            lines.append(PlaneLine(a: ball, b: hip, color: .spGold))
+        } else if let hip = pose[.rightHip] ?? pose[.leftHip] {
+            lines.append(PlaneLine(a: ball, b: hip, color: .spGold))
+        }
+        if let sh = pose[.rightShoulder] ?? pose[.leftShoulder] {
+            lines.append(PlaneLine(a: ball, b: sh, color: .green))
+        }
+        planeLines = lines
     }
 }
 
@@ -526,6 +679,7 @@ struct ClipPlayerView: View {
                 Button { player.play() } label: { Image(systemName: "play.fill").font(.title) }
                 Button { player.pause() } label: { Image(systemName: "pause.fill").font(.title2) }
             }.padding()
+            OverlayToggles()
             Spacer()
         }
         .navigationTitle(clip.view.rawValue)
@@ -534,6 +688,28 @@ struct ClipPlayerView: View {
             // Del klip (fx til OneDrive) -> analyse paa PC'en
             ToolbarItem(placement: .primaryAction) {
                 ShareLink(item: clip.url) { Image(systemName: "square.and.arrow.up") }
+            }
+        }
+    }
+}
+
+// MARK: - Overlay-toggles (trail + plane, huskes via AppStorage)
+
+struct OverlayToggles: View {
+    @AppStorage("showClubTrail") private var showClubTrail = true
+    @AppStorage("showPlaneLines") private var showPlaneLines = false
+    var body: some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: $showClubTrail) {
+                Label("Klubhoved-spor", systemImage: "scribble.variable").font(.caption.weight(.semibold))
+            }
+            .toggleStyle(.button).tint(.spGold)
+            Toggle(isOn: $showPlaneLines) {
+                Label("Plane lines", systemImage: "line.diagonal").font(.caption.weight(.semibold))
+            }
+            .toggleStyle(.button).tint(.spGold)
+            if ClubAnalyzer.model == nil {
+                Text("Model mangler i bygget").font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -678,6 +854,80 @@ struct PoseOverlay: View {
     }
 }
 
+// MARK: - Klubhoved-trail (guld i tilbagesving, groen i nedsving)
+
+struct ClubTrailOverlay: View {
+    let cache: ClubCache
+    let upTo: Double          // tegn kun spor frem til aktuel afspilningstid
+    let topIdx: Int
+    let videoSize: CGSize
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard videoSize.width > 0, videoSize.height > 0 else { return }
+            let scale = min(size.width / videoSize.width, size.height / videoSize.height)
+            let dispW = videoSize.width * scale, dispH = videoSize.height * scale
+            let ox = (size.width - dispW) / 2, oy = (size.height - dispH) / 2
+            func p(_ f: ClubFrame) -> CGPoint {
+                CGPoint(x: ox + f.x * dispW, y: oy + f.y * dispH)
+            }
+            let pts = cache.frames.enumerated().filter { $0.element.t <= upTo }
+            guard pts.count > 1 else { return }
+            func stroke(_ seg: [CGPoint], _ color: Color) {
+                guard seg.count > 1 else { return }
+                var path = Path(); path.move(to: seg[0])
+                for q in seg.dropFirst() { path.addLine(to: q) }
+                ctx.stroke(path, with: .color(color.opacity(0.95)),
+                           style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            }
+            let back = pts.filter { $0.offset <= topIdx }.map { p($0.element) }
+            let down = pts.filter { $0.offset >= topIdx }.map { p($0.element) }
+            stroke(back, .spGold)        // tilbagesving = guld
+            stroke(down, .green)         // nedsving (og igennem) = groen
+            if let last = pts.last {
+                let q = p(last.element)
+                ctx.fill(Path(ellipseIn: CGRect(x: q.x - 5, y: q.y - 5, width: 10, height: 10)),
+                         with: .color(.white))
+            }
+        }
+    }
+}
+
+// MARK: - Plane lines (statisk fra address: bold->hofte guld, bold->skulder groen)
+
+struct PlaneLine: Identifiable {
+    let id = UUID()
+    let a: CGPoint            // normaliserede koordinater
+    let b: CGPoint
+    let color: Color
+}
+
+struct PlaneLinesOverlay: View {
+    let lines: [PlaneLine]
+    let videoSize: CGSize
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard videoSize.width > 0, videoSize.height > 0 else { return }
+            let scale = min(size.width / videoSize.width, size.height / videoSize.height)
+            let dispW = videoSize.width * scale, dispH = videoSize.height * scale
+            let ox = (size.width - dispW) / 2, oy = (size.height - dispH) / 2
+            for line in lines {
+                let a = CGPoint(x: ox + line.a.x * dispW, y: oy + line.a.y * dispH)
+                let b = CGPoint(x: ox + line.b.x * dispW, y: oy + line.b.y * dispH)
+                // forlaeng linjen gennem hele billedet
+                let dx = b.x - a.x, dy = b.y - a.y
+                guard abs(dx) > 0.1 || abs(dy) > 0.1 else { continue }
+                let p1 = CGPoint(x: a.x - dx * 10, y: a.y - dy * 10)
+                let p2 = CGPoint(x: a.x + dx * 10, y: a.y + dy * 10)
+                var path = Path(); path.move(to: p1); path.addLine(to: p2)
+                ctx.stroke(path, with: .color(line.color.opacity(0.8)),
+                           style: StrokeStyle(lineWidth: 2.5, dash: [7, 5]))
+            }
+        }
+    }
+}
+
 // MARK: - Lyd-meter
 
 struct AudioMeter: View {
@@ -777,8 +1027,11 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var audioLevel: Float = 0
     @Published var impactFlash = false
     @Published var windSensitivity: WindSensitivity = .normal
+    @Published var poseGateEnabled = true   // lyd taeller kun som impact hvis haenderne var i fart
     var noiseFloor: Float = 0.02
     var lastImpactAt: Double = 0
+    var lastFastHandsAt: Double = 0
+    private var lastHandPts: [VNHumanBodyPoseObservation.JointName: (CGPoint, Double)] = [:]
 
     var onClipSaved: (() -> Void)?
 
@@ -964,6 +1217,21 @@ final class CameraManager: NSObject, ObservableObject {
 
     func arm() { sessionQueue.async { self.armInternal() } }
 
+    /// Bibliotek aabnes: pause lytningen (kun i auto/Range session; manuel optagelse roeres ikke).
+    func pauseListening() {
+        sessionQueue.async {
+            guard self.autoMode, self.movieOutput.isRecording else { return }
+            self.suppressRearm = true
+            self.movieOutput.stopRecording()
+        }
+    }
+    /// Bibliotek lukkes: genoptag lytningen hvis Range session stadig er aktiv.
+    func resumeListening() {
+        sessionQueue.async {
+            if self.autoMode && !self.movieOutput.isRecording { self.armInternal() }
+        }
+    }
+
     private func autoModeChanged() {
         sessionQueue.async {
             if self.autoMode {
@@ -1067,6 +1335,17 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
                 result[name] = CGPoint(x: pt.location.x, y: 1 - pt.location.y); confSum += pt.confidence; count += 1
             }
             let avg = count > 0 ? confSum / Float(count) : 0
+            // Pose-gate: registrer hurtig haand/arm-bevaegelse (sving i gang).
+            // Wrist OG elbow (elbow er mere robust ved motion blur i nedsvinget).
+            for j in [VNHumanBodyPoseObservation.JointName.rightWrist, .leftWrist, .rightElbow, .leftElbow] {
+                if let p = result[j] {
+                    if let (prev, t) = lastHandPts[j], now - t < 0.25, now > t {
+                        let speed = hypot(p.x - prev.x, p.y - prev.y) / CGFloat(now - t)
+                        if speed > 1.2 { lastFastHandsAt = now }   // ~>1.2 skaermbredde/s = sving
+                    }
+                    lastHandPts[j] = (p, now)
+                }
+            }
             Task { @MainActor in
                 self.pose = result
                 self.poseInfo = count > 0 ? "Pose: \(count)/19 led · konf \(String(format: "%.2f", avg))" : "Pose: ingen person"
@@ -1099,7 +1378,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate,
         let now = CFAbsoluteTimeGetCurrent()
         let ratio = windSensitivity.ratio
         let floor = windSensitivity.floor
-        let isImpact = peak > floor && peak > noiseFloor * ratio && (now - lastImpactAt) > 0.6
+        let soundOK = peak > floor && peak > noiseFloor * ratio && (now - lastImpactAt) > 0.6
+        let handsOK = !poseGateEnabled || (now - lastFastHandsAt) < 0.5
+        let isImpact = soundOK && handsOK
         if isImpact { lastImpactAt = now }
         else { noiseFloor = noiseFloor * 0.97 + peak * 0.03 }
         return isImpact
@@ -1263,6 +1544,7 @@ struct ContentView: View {
 
 struct OnboardingView: View {
     var onSelect: (SessionMode) -> Void
+    @State private var showTutorial = false
     var body: some View {
         ZStack {
             FlowBackground()
@@ -1277,9 +1559,17 @@ struct OnboardingView: View {
                            sub: "Kig på ét slag i detaljer") { onSelect(.single) }
                 choiceCard(icon: "repeat", title: "Træningssession",
                            sub: "Slå en spand – hvert slag fanges automatisk") { onSelect(.multiple) }
+                Button { showTutorial = true } label: {
+                    Label("Sådan virker det", systemImage: "questionmark.circle")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Color.spGold.opacity(0.9))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 6)
                 Spacer()
             }
             .padding(.horizontal, 24)
+            .sheet(isPresented: $showTutorial) { TutorialView() }
         }
     }
     private func choiceCard(icon: String, title: String, sub: String,
@@ -1302,6 +1592,52 @@ struct OnboardingView: View {
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.spGold.opacity(0.25), lineWidth: 1))
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct TutorialView: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        ZStack {
+            FlowBackground()
+            VStack(alignment: .leading, spacing: 22) {
+                HStack {
+                    Text("Sådan virker det").font(.title2.weight(.semibold)).foregroundStyle(.white)
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.title2)
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                }
+                .padding(.bottom, 4)
+                step(num: 1, icon: "hand.tap", title: "Vælg hvad du vil lave",
+                     text: "Ét sving til detaljer – eller Træningssession, hvor hvert slag fanges automatisk.")
+                step(num: 2, icon: "iphone.gen3", title: "Stil telefonen",
+                     text: "Vælg vinkel: bagfra (Down the Line) eller forfra (Face-on). Brug gerne et stativ.")
+                step(num: 3, icon: "person.crop.rectangle", title: "Stil dig i boksen",
+                     text: "Flyt dig til rammen bliver grøn – så er afstand og placering rigtig.")
+                step(num: 4, icon: "figure.golf", title: "Bare sving",
+                     text: "Appen hører slaget og gemmer kun selve svinget. Se dine klip under \"My swings\".")
+                Spacer()
+            }
+            .padding(24)
+        }
+        .presentationDetents([.medium, .large])
+    }
+    private func step(num: Int, icon: String, title: String, text: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            ZStack {
+                Circle().fill(Color.spSurface).frame(width: 40, height: 40)
+                    .overlay(Circle().stroke(Color.spGold.opacity(0.4), lineWidth: 1))
+                Image(systemName: icon).font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.spGold)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(num). \(title)").font(.headline).foregroundStyle(.white)
+                Text(text).font(.subheadline).foregroundStyle(.white.opacity(0.65))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
