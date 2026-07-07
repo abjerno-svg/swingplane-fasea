@@ -34,7 +34,10 @@ enum SwingView: String, CaseIterable {
 struct PoseFrame: Codable { let t: Double; let joints: [String: [Double]] }
 struct PoseCache: Codable { let width: Double; let height: Double; let frames: [PoseFrame] }
 struct ClubFrame: Codable { let t: Double; let x: Double; let y: Double; let c: Double }
-struct ClubCache: Codable { let v: Int; let width: Double; let height: Double; let frames: [ClubFrame] }
+struct ClubCache: Codable {
+    let v: Int; let width: Double; let height: Double; let frames: [ClubFrame]
+    var ballX: Double? = nil; var ballY: Double? = nil    // bold-klassen ved address (plane-anker)
+}
 
 enum PoseKeys {
     static let map: [(VNHumanBodyPoseObservation.JointName, String)] = [
@@ -70,7 +73,7 @@ enum ClubAnalyzer {
     static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
         let cacheURL = cacheURL(for: clipURL)
         if let data = try? Data(contentsOf: cacheURL),
-           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 3 {
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 4 {
             completion(cache); return
         }
         guard let model = model else { completion(nil); return }
@@ -82,27 +85,38 @@ enum ClubAnalyzer {
             gen.requestedTimeToleranceBefore = .zero
             gen.requestedTimeToleranceAfter = .zero
             var frames: [ClubFrame] = []
+            var ballXs: [Double] = [], ballYs: [Double] = []
             var w = 1080.0, h = 1920.0
             let step = 1.0 / 60.0     // taettere end pose: trail skal vaere glat
             var t = 0.0
             while t < max(dur, 0.01) {
                 if let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) {
                     w = Double(cg.width); h = Double(cg.height)
-                    if let det = detect(cg: cg, model: model) {
-                        frames.append(ClubFrame(t: t, x: det.x, y: det.y, c: det.c))
+                    let det = detect(cg: cg, model: model)
+                    if let c = det.club {
+                        frames.append(ClubFrame(t: t, x: c.x, y: c.y, c: c.c))
+                    }
+                    if t <= 0.6, let b = det.ball {
+                        ballXs.append(b.x); ballYs.append(b.y)
                     }
                 }
                 t += step
             }
-            let cache = ClubCache(v: 3, width: w, height: h, frames: frames)
+            var cache = ClubCache(v: 4, width: w, height: h, frames: frames)
+            if !ballXs.isEmpty {
+                cache.ballX = ballXs.sorted()[ballXs.count / 2]
+                cache.ballY = ballYs.sorted()[ballYs.count / 2]
+            }
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
         }
     }
 
-    /// Letterbox 640x640 (top-venstre, som valideret i sandkassen), kor modellen,
-    /// dekod (1,7,8400): raekke 0-3 = cx,cy,w,h; raekke 4-6 = klasse-konfidenser.
-    private static func detect(cg: CGImage, model: MLModel) -> (x: Double, y: Double, c: Double)? {
+    /// Letterbox 640x640 (top-venstre, praecis som valideret sandbox-pipeline), koer modellen.
+    /// v3-klasser: raekke 4 = bold, raekke 5 = KLUBHOVED, raekke 6 = haender.
+    /// Stride-sikker aflaesning (ANE kan levere ikke-kontinuert MLMultiArray).
+    private static func detect(cg: CGImage, model: MLModel)
+        -> (club: (x: Double, y: Double, c: Double)?, ball: (x: Double, y: Double, c: Double)?) {
         let W = cg.width, H = cg.height
         let sc = 640.0 / Double(max(W, H))
         let sw = Int(Double(W) * sc), sh = Int(Double(H) * sc)
@@ -110,7 +124,7 @@ enum ClubAnalyzer {
         let attrs = [kCVPixelBufferCGImageCompatibilityKey: true,
                      kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary
         CVPixelBufferCreate(kCFAllocatorDefault, 640, 640, kCVPixelFormatType_32BGRA, attrs, &pb)
-        guard let buf = pb else { return nil }
+        guard let buf = pb else { return (nil, nil) }
         CVPixelBufferLockBaseAddress(buf, [])
         defer { CVPixelBufferUnlockBaseAddress(buf, []) }
         guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buf),
@@ -118,45 +132,51 @@ enum ClubAnalyzer {
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return (nil, nil) }
         ctx.setFillColor(CGColor(red: 114/255, green: 114/255, blue: 114/255, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 640))
-        // Standard-flip (CoreMLHelpers-opskriften): uden denne ligger billedet PAA HOVEDET
-        // i pixelbufferen -> alle y-koordinater spejlvendt (device-fund 2026-07-07:
-        // plane lines fra toppen af billedet). Efter flip: opret billede, top-venstre.
-        ctx.translateBy(x: 0, y: 640)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+        // Ingen flip: CGContext.draw laegger CGImage OPRET i bufferen.
+        // Rect oeverst i CG-koordinater (y: 640-sh) = raekke 0..sh i hukommelsen = TOP-venstre.
+        ctx.draw(cg, in: CGRect(x: 0, y: 640 - sh, width: sw, height: sh))
         guard let inp = try? MLDictionaryFeatureProvider(dictionary: ["images": MLFeatureValue(pixelBuffer: buf)]),
               let outp = try? model.prediction(from: inp),
-              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return nil }
+              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return (nil, nil) }
         let n = 8400
-        let count = arr.count
-        guard count >= 7 * n else { return nil }
-        // Outputtet kan vaere fp16 (konverteret med FLOAT16) — laes efter faktisk datatype,
-        // ellers laeses ud over bufferen (SIGSEGV, crash-log 2026-07-07).
-        var vals = [Float](repeating: 0, count: 7 * n)
-        switch arr.dataType {
-        case .float32:
-            let p = arr.dataPointer.bindMemory(to: Float.self, capacity: count)
-            for i in 0..<(7 * n) { vals[i] = p[i] }
-        case .float16:
-            let p = arr.dataPointer.bindMemory(to: Float16.self, capacity: count)
-            for i in 0..<(7 * n) { vals[i] = Float(p[i]) }
-        case .double:
-            let p = arr.dataPointer.bindMemory(to: Double.self, capacity: count)
-            for i in 0..<(7 * n) { vals[i] = Float(p[i]) }
-        default:
-            return nil
+        let shape = arr.shape.map(\.intValue)
+        let strides = arr.strides.map(\.intValue)
+        var chS = n, iS = 1, nCh = 7
+        if shape.count == 3 { chS = strides[1]; iS = strides[2]; nCh = shape[1] }
+        else if shape.count == 2 { chS = strides[0]; iS = strides[1]; nCh = shape[0] }
+        guard nCh >= 7, shape.last == n || shape.count == 3 else { return (nil, nil) }
+        let base = arr.dataPointer
+        let dt = arr.dataType
+        func row(_ ch: Int) -> [Float] {
+            var out = [Float](repeating: 0, count: n)
+            let maxIdx = ch * chS + (n - 1) * iS + 1
+            switch dt {
+            case .float32:
+                let p = base.bindMemory(to: Float.self, capacity: maxIdx)
+                for i in 0..<n { out[i] = p[ch * chS + i * iS] }
+            case .float16:
+                let p = base.bindMemory(to: Float16.self, capacity: maxIdx)
+                for i in 0..<n { out[i] = Float(p[ch * chS + i * iS]) }
+            case .double:
+                let p = base.bindMemory(to: Double.self, capacity: maxIdx)
+                for i in 0..<n { out[i] = Float(p[ch * chS + i * iS]) }
+            default: break
+            }
+            return out
         }
-        var bestC: Float = 0; var bestI = -1
-        for i in 0..<n {
-            let c = max(vals[4*n + i], max(vals[5*n + i], vals[6*n + i]))
-            if c > bestC { bestC = c; bestI = i }
+        let cxr = row(0), cyr = row(1)
+        func best(_ conf: [Float], _ thr: Float) -> (x: Double, y: Double, c: Double)? {
+            var bC: Float = 0; var bI = -1
+            for i in 0..<n where conf[i] > bC { bC = conf[i]; bI = i }
+            guard bC > thr, bI >= 0 else { return nil }
+            return (x: (Double(cxr[bI]) / sc) / Double(W),
+                    y: (Double(cyr[bI]) / sc) / Double(H),
+                    c: Double(bC))
         }
-        guard bestC > 0.25, bestI >= 0 else { return nil }
-        let cx = Double(vals[bestI]), cy = Double(vals[n + bestI])
-        return (x: (cx / sc) / Double(W), y: (cy / sc) / Double(H), c: Double(bestC))
+        return (club: best(row(5), 0.25), ball: best(row(4), 0.20))
     }
 
     /// Split-indeks til farveskift: toppen = hoejeste klubhoved-punkt FOER impact.
@@ -638,8 +658,9 @@ struct SkeletonVideo: View {
     @State private var clubTopIdx = 0
     @State private var currentTime: Double = 0
     @State private var planeLines: [PlaneLine] = []
-    @State private var showClubTrail = false
-    @State private var showPlaneLines = false
+    var showClubTrail: Bool = false
+    var showPlaneLines: Bool = false
+    var onAnalysisState: ((Bool, Bool, Int) -> Void)? = nil   // (poseBusy, clubBusy, punkter)
 
     var body: some View {
         ZStack {
@@ -664,39 +685,6 @@ struct SkeletonVideo: View {
                 VStack { ProgressView(); Text("Analyserer pose…").font(.caption).foregroundStyle(.white) }
                     .padding().background(.black.opacity(0.6)).clipShape(RoundedRectangle(cornerRadius: 10))
             }
-            VStack {
-                Spacer()
-                HStack(spacing: 10) {
-                    Toggle(isOn: $showClubTrail) {
-                        Label(clubAnalyzing ? "Analyserer…" : "Klubhoved-spor",
-                              systemImage: clubAnalyzing ? "hourglass" : "scribble.variable")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .toggleStyle(.button).tint(.spGold)
-                    .disabled(clubAnalyzing || ClubAnalyzer.model == nil)
-                    if clip.view == .dtl {
-                        Toggle(isOn: $showPlaneLines) {
-                            Label((clubAnalyzing || analyzing) ? "Analyserer…" : "Plane lines",
-                                  systemImage: (clubAnalyzing || analyzing) ? "hourglass" : "line.diagonal")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .toggleStyle(.button).tint(.spGold)
-                        .disabled(clubAnalyzing || analyzing)
-                    }
-                }
-                Group {
-                    if ClubAnalyzer.model == nil {
-                        Text("Klubhoved: model mangler i bygget")
-                    } else if !clubAnalyzing {
-                        Text("Klubhoved: \(clubCache?.frames.count ?? 0) punkter")
-                    }
-                }
-                .font(.caption2).foregroundStyle(.white.opacity(0.75))
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(.black.opacity(0.45)).clipShape(Capsule())
-                .allowsHitTesting(false)
-                .padding(.bottom, 6)
-            }
         }
         .onAppear {
             player.replaceCurrentItem(with: AVPlayerItem(url: clip.url))
@@ -712,11 +700,13 @@ struct SkeletonVideo: View {
             PoseAnalyzer.loadOrCompute(for: clip.url) { c in
                 self.cache = c; self.analyzing = false
                 self.computePlaneLines()
+                self.onAnalysisState?(false, self.clubAnalyzing, self.clubCache?.frames.count ?? 0)
             }
             ClubAnalyzer.loadOrCompute(for: clip.url) { cc in
                 self.clubCache = cc; self.clubAnalyzing = false
                 if let cc { self.clubTopIdx = ClubAnalyzer.topIndex(in: cc, impact: clip.impact) }
                 self.computePlaneLines()
+                self.onAnalysisState?(self.analyzing, false, cc?.frames.count ?? 0)
             }
         }
         .onDisappear {
@@ -730,10 +720,14 @@ struct SkeletonVideo: View {
     private func computePlaneLines() {
         guard let cc = clubCache, let pc = cache else { return }
         let early = cc.frames.filter { $0.t <= 0.4 }
-        guard !early.isEmpty else { return }
-        let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
-        let ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
-        let t0 = early[early.count / 2].t
+        let ball: CGPoint
+        if let bx = cc.ballX, let by = cc.ballY {
+            ball = CGPoint(x: bx, y: by)          // bold-klassen = bedste anker
+        } else if !early.isEmpty {
+            let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
+            ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
+        } else { return }
+        let t0 = early.isEmpty ? 0.15 : early[early.count / 2].t
         let pose = PoseAnalyzer.pose(at: t0, in: pc)
         var lines: [PlaneLine] = []
         if let rh = pose[.rightHip], let lh = pose[.leftHip] {
@@ -754,17 +748,50 @@ struct SkeletonVideo: View {
 struct ClipPlayerView: View {
     let clip: Clip
     @State private var player = AVPlayer()
+    @State private var showTrail = false
+    @State private var showPlane = false
+    @State private var poseBusy = true
+    @State private var clubBusy = true
+    @State private var clubPoints = 0
 
     var body: some View {
         VStack {
-            SkeletonVideo(clip: clip, player: player).frame(maxHeight: 520)
+            SkeletonVideo(clip: clip, player: player,
+                          showClubTrail: showTrail, showPlaneLines: showPlane,
+                          onAnalysisState: { p, c, n in
+                              poseBusy = p; clubBusy = c; clubPoints = n
+                          })
+                .frame(maxHeight: 520)
             HStack(spacing: 24) {
                 Button { player.seek(to: .zero); player.play() } label: {
                     Image(systemName: "gobackward").font(.title2)
                 }
                 Button { player.play() } label: { Image(systemName: "play.fill").font(.title) }
                 Button { player.pause() } label: { Image(systemName: "pause.fill").font(.title2) }
-            }.padding()
+            }.padding(.top, 8)
+            HStack(spacing: 10) {
+                Toggle(isOn: $showTrail) {
+                    Label(clubBusy ? "Analyserer…" : "Klubhoved-spor",
+                          systemImage: clubBusy ? "hourglass" : "scribble.variable")
+                        .font(.caption.weight(.semibold))
+                }
+                .toggleStyle(.button).tint(.spGold)
+                .disabled(clubBusy || ClubAnalyzer.model == nil)
+                if clip.view == .dtl {
+                    Toggle(isOn: $showPlane) {
+                        Label((clubBusy || poseBusy) ? "Analyserer…" : "Plane lines",
+                              systemImage: (clubBusy || poseBusy) ? "hourglass" : "line.diagonal")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .toggleStyle(.button).tint(.spGold)
+                    .disabled(clubBusy || poseBusy)
+                }
+            }
+            if ClubAnalyzer.model == nil {
+                Text("Klubhoved-model mangler i bygget").font(.caption2).foregroundStyle(.orange)
+            } else if !clubBusy {
+                Text("Klubhoved: \(clubPoints) punkter").font(.caption2).foregroundStyle(.secondary)
+            }
             Spacer()
         }
         .navigationTitle(clip.view.rawValue)
