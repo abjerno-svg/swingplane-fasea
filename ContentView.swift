@@ -36,7 +36,7 @@ struct PoseCache: Codable { let width: Double; let height: Double; let frames: [
 struct ClubFrame: Codable { let t: Double; let x: Double; let y: Double; let c: Double }
 struct ClubCache: Codable {
     let v: Int; let width: Double; let height: Double; let frames: [ClubFrame]
-    var ballX: Double? = nil; var ballY: Double? = nil    // bold-klassen ved address (plane-anker)
+    var ballCands: [[Double]] = []    // [x,y,conf] bold-kandidater i klippets foerste 0,6s
 }
 
 enum PoseKeys {
@@ -73,7 +73,7 @@ enum ClubAnalyzer {
     static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
         let cacheURL = cacheURL(for: clipURL)
         if let data = try? Data(contentsOf: cacheURL),
-           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 4 {
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 5 {
             completion(cache); return
         }
         guard let model = model else { completion(nil); return }
@@ -84,29 +84,29 @@ enum ClubAnalyzer {
             gen.appliesPreferredTrackTransform = true
             gen.requestedTimeToleranceBefore = .zero
             gen.requestedTimeToleranceAfter = .zero
+            gen.maximumSize = CGSize(width: 640, height: 640)   // modellen ser 640 — fuld 1080x1920 = 9x spildt RAM (jetsam)
             var frames: [ClubFrame] = []
-            var ballXs: [Double] = [], ballYs: [Double] = []
+            var ballCands: [[Double]] = []
             var w = 1080.0, h = 1920.0
             let step = 1.0 / 60.0     // taettere end pose: trail skal vaere glat
             var t = 0.0
             while t < max(dur, 0.01) {
-                if let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) {
-                    w = Double(cg.width); h = Double(cg.height)
-                    let det = detect(cg: cg, model: model)
-                    if let c = det.club {
-                        frames.append(ClubFrame(t: t, x: c.x, y: c.y, c: c.c))
-                    }
-                    if t <= 0.6, let b = det.ball {
-                        ballXs.append(b.x); ballYs.append(b.y)
+                autoreleasepool {
+                    if let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) {
+                        w = Double(cg.width); h = Double(cg.height)
+                        let det = detect(cg: cg, model: model)
+                        if let c = det.club {
+                            frames.append(ClubFrame(t: t, x: c.x, y: c.y, c: c.c))
+                        }
+                        if t <= 0.6 {
+                            for b in det.balls { ballCands.append([b.x, b.y, b.c]) }
+                        }
                     }
                 }
                 t += step
             }
-            var cache = ClubCache(v: 4, width: w, height: h, frames: frames)
-            if !ballXs.isEmpty {
-                cache.ballX = ballXs.sorted()[ballXs.count / 2]
-                cache.ballY = ballYs.sorted()[ballYs.count / 2]
-            }
+            var cache = ClubCache(v: 5, width: w, height: h, frames: frames)
+            cache.ballCands = ballCands
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
         }
@@ -116,7 +116,7 @@ enum ClubAnalyzer {
     /// v3-klasser: raekke 4 = bold, raekke 5 = KLUBHOVED, raekke 6 = haender.
     /// Stride-sikker aflaesning (ANE kan levere ikke-kontinuert MLMultiArray).
     private static func detect(cg: CGImage, model: MLModel)
-        -> (club: (x: Double, y: Double, c: Double)?, ball: (x: Double, y: Double, c: Double)?) {
+        -> (club: (x: Double, y: Double, c: Double)?, balls: [(x: Double, y: Double, c: Double)]) {
         let W = cg.width, H = cg.height
         let sc = 640.0 / Double(max(W, H))
         let sw = Int(Double(W) * sc), sh = Int(Double(H) * sc)
@@ -124,7 +124,7 @@ enum ClubAnalyzer {
         let attrs = [kCVPixelBufferCGImageCompatibilityKey: true,
                      kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary
         CVPixelBufferCreate(kCFAllocatorDefault, 640, 640, kCVPixelFormatType_32BGRA, attrs, &pb)
-        guard let buf = pb else { return (nil, nil) }
+        guard let buf = pb else { return (nil, []) }
         CVPixelBufferLockBaseAddress(buf, [])
         defer { CVPixelBufferUnlockBaseAddress(buf, []) }
         guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buf),
@@ -132,7 +132,7 @@ enum ClubAnalyzer {
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return (nil, nil) }
+                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return (nil, []) }
         ctx.setFillColor(CGColor(red: 114/255, green: 114/255, blue: 114/255, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 640))
         // Ingen flip: CGContext.draw laegger CGImage OPRET i bufferen.
@@ -140,14 +140,14 @@ enum ClubAnalyzer {
         ctx.draw(cg, in: CGRect(x: 0, y: 640 - sh, width: sw, height: sh))
         guard let inp = try? MLDictionaryFeatureProvider(dictionary: ["images": MLFeatureValue(pixelBuffer: buf)]),
               let outp = try? model.prediction(from: inp),
-              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return (nil, nil) }
+              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return (nil, []) }
         let n = 8400
         let shape = arr.shape.map(\.intValue)
         let strides = arr.strides.map(\.intValue)
         var chS = n, iS = 1, nCh = 7
         if shape.count == 3 { chS = strides[1]; iS = strides[2]; nCh = shape[1] }
         else if shape.count == 2 { chS = strides[0]; iS = strides[1]; nCh = shape[0] }
-        guard nCh >= 7, shape.last == n || shape.count == 3 else { return (nil, nil) }
+        guard nCh >= 7, shape.last == n || shape.count == 3 else { return (nil, []) }
         let base = arr.dataPointer
         let dt = arr.dataType
         func row(_ ch: Int) -> [Float] {
@@ -176,7 +176,22 @@ enum ClubAnalyzer {
                     y: (Double(cyr[bI]) / sc) / Double(H),
                     c: Double(bC))
         }
-        return (club: best(row(5), 0.25), ball: best(row(4), 0.20))
+        let ballConf = row(4)
+        var balls: [(x: Double, y: Double, c: Double)] = []
+        var used: [(Double, Double)] = []
+        for _ in 0..<3 {
+            var bC: Float = 0; var bI = -1
+            for i in 0..<n where ballConf[i] > bC {
+                let x = Double(cxr[i]), y = Double(cyr[i])
+                if used.contains(where: { abs($0.0 - x) < 15 && abs($0.1 - y) < 15 }) { continue }
+                bC = ballConf[i]; bI = i
+            }
+            guard bC > 0.12, bI >= 0 else { break }
+            used.append((Double(cxr[bI]), Double(cyr[bI])))
+            balls.append((x: (Double(cxr[bI]) / sc) / Double(W),
+                          y: (Double(cyr[bI]) / sc) / Double(H), c: Double(bC)))
+        }
+        return (club: best(row(5), 0.25), balls: balls)
     }
 
     /// Split-indeks til farveskift: toppen = hoejeste klubhoved-punkt FOER impact.
@@ -306,12 +321,14 @@ enum PoseAnalyzer {
             gen.appliesPreferredTrackTransform = true
             gen.requestedTimeToleranceBefore = .zero
             gen.requestedTimeToleranceAfter = .zero
+            gen.maximumSize = CGSize(width: 1024, height: 1024)  // jetsam-fix: Vision behoever ikke 1080x1920
 
             var frames: [PoseFrame] = []
             var w = 1080.0, h = 1920.0
             let step = 1.0 / 30.0
             var t = 0.0
             while t < max(dur, 0.01) {
+                autoreleasepool { () -> Void in
                 if let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) {
                     w = Double(cg.width); h = Double(cg.height)
                     let handler = VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:])
@@ -326,6 +343,7 @@ enum PoseAnalyzer {
                         }
                     }
                     frames.append(PoseFrame(t: t, joints: joints))
+                }
                 }
                 t += step
             }
@@ -720,15 +738,30 @@ struct SkeletonVideo: View {
     private func computePlaneLines() {
         guard let cc = clubCache, let pc = cache else { return }
         let early = cc.frames.filter { $0.t <= 0.4 }
+        let t0 = early.isEmpty ? 0.15 : early[early.count / 2].t
+        let pose = PoseAnalyzer.pose(at: t0, in: pc)
+        // Forventet boldposition ved address: under haenderne, i ankelhoejde.
+        // Vaelg kandidaten naermest forventningen (loese bolde paa maatten kan have HOEJERE conf).
+        var expected: CGPoint? = nil
+        if let w = pose[.rightWrist] ?? pose[.leftWrist] {
+            let ankleY = (pose[.rightAnkle] ?? pose[.leftAnkle])?.y ?? min(w.y + 0.25, 0.95)
+            expected = CGPoint(x: w.x, y: ankleY)
+        }
         let ball: CGPoint
-        if let bx = cc.ballX, let by = cc.ballY {
-            ball = CGPoint(x: bx, y: by)          // bold-klassen = bedste anker
+        if let exp = expected, !cc.ballCands.isEmpty {
+            let bestCand = cc.ballCands.min { a, b in
+                let da = hypot(a[0] - exp.x, a[1] - exp.y) - 0.05 * a[2]
+                let db = hypot(b[0] - exp.x, b[1] - exp.y) - 0.05 * b[2]
+                return da < db
+            }!
+            ball = CGPoint(x: bestCand[0], y: bestCand[1])
+        } else if !cc.ballCands.isEmpty {
+            let xs = cc.ballCands.map { $0[0] }.sorted(), ys = cc.ballCands.map { $0[1] }.sorted()
+            ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
         } else if !early.isEmpty {
             let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
             ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
         } else { return }
-        let t0 = early.isEmpty ? 0.15 : early[early.count / 2].t
-        let pose = PoseAnalyzer.pose(at: t0, in: pc)
         var lines: [PlaneLine] = []
         if let rh = pose[.rightHip], let lh = pose[.leftHip] {
             let hip = CGPoint(x: (rh.x + lh.x) / 2, y: (rh.y + lh.y) / 2)
