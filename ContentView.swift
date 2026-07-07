@@ -34,7 +34,7 @@ enum SwingView: String, CaseIterable {
 struct PoseFrame: Codable { let t: Double; let joints: [String: [Double]] }
 struct PoseCache: Codable { let width: Double; let height: Double; let frames: [PoseFrame] }
 struct ClubFrame: Codable { let t: Double; let x: Double; let y: Double; let c: Double }
-struct ClubCache: Codable { let width: Double; let height: Double; let frames: [ClubFrame] }
+struct ClubCache: Codable { let v: Int; let width: Double; let height: Double; let frames: [ClubFrame] }
 
 enum PoseKeys {
     static let map: [(VNHumanBodyPoseObservation.JointName, String)] = [
@@ -94,7 +94,7 @@ enum ClubAnalyzer {
                 }
                 t += step
             }
-            let cache = ClubCache(width: w, height: h, frames: frames)
+            let cache = ClubCache(v: 2, width: w, height: h, frames: frames)
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
         }
@@ -150,7 +150,7 @@ enum ClubAnalyzer {
             let c = max(vals[4*n + i], max(vals[5*n + i], vals[6*n + i]))
             if c > bestC { bestC = c; bestI = i }
         }
-        guard bestC > 0.35, bestI >= 0 else { return nil }
+        guard bestC > 0.25, bestI >= 0 else { return nil }
         let cx = Double(vals[bestI]), cy = Double(vals[n + bestI])
         return (x: (cx / sc) / Double(W), y: (cy / sc) / Double(H), c: Double(bestC))
     }
@@ -599,6 +599,7 @@ struct SkeletonVideo: View {
     @State private var analyzing = true
     @State private var observer: Any?
     @State private var clubCache: ClubCache?
+    @State private var clubAnalyzing = true
     @State private var clubTopIdx = 0
     @State private var currentTime: Double = 0
     @State private var planeLines: [PlaneLine] = []
@@ -614,7 +615,7 @@ struct SkeletonVideo: View {
                             fill: false)
                     .allowsHitTesting(false)
             }
-            if showPlaneLines, let cc = clubCache, !planeLines.isEmpty {
+            if showPlaneLines, clip.view == .dtl, let cc = clubCache, !planeLines.isEmpty {
                 PlaneLinesOverlay(lines: planeLines,
                                   videoSize: CGSize(width: cc.width, height: cc.height))
                     .allowsHitTesting(false)
@@ -628,6 +629,23 @@ struct SkeletonVideo: View {
                 VStack { ProgressView(); Text("Analyserer pose…").font(.caption).foregroundStyle(.white) }
                     .padding().background(.black.opacity(0.6)).clipShape(RoundedRectangle(cornerRadius: 10))
             }
+            VStack {
+                Spacer()
+                Group {
+                    if ClubAnalyzer.model == nil {
+                        Text("Klubhoved: model mangler i bygget")
+                    } else if clubAnalyzing {
+                        Text("Analyserer klubhoved…")
+                    } else {
+                        Text("Klubhoved: \(clubCache?.frames.count ?? 0) punkter")
+                    }
+                }
+                .font(.caption2).foregroundStyle(.white.opacity(0.75))
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(.black.opacity(0.45)).clipShape(Capsule())
+                .padding(.bottom, 6)
+            }
+            .allowsHitTesting(false)
         }
         .onAppear {
             player.replaceCurrentItem(with: AVPlayerItem(url: clip.url))
@@ -645,7 +663,7 @@ struct SkeletonVideo: View {
                 self.computePlaneLines()
             }
             ClubAnalyzer.loadOrCompute(for: clip.url) { cc in
-                self.clubCache = cc
+                self.clubCache = cc; self.clubAnalyzing = false
                 if let cc { self.clubTopIdx = ClubAnalyzer.topIndex(in: cc, impact: clip.impact) }
                 self.computePlaneLines()
             }
