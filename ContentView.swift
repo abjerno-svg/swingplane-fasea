@@ -73,7 +73,7 @@ enum ClubAnalyzer {
     static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
         let cacheURL = cacheURL(for: clipURL)
         if let data = try? Data(contentsOf: cacheURL),
-           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 5 {
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 6 {
             completion(cache); return
         }
         guard let model = model else { completion(nil); return }
@@ -105,7 +105,7 @@ enum ClubAnalyzer {
                 }
                 t += step
             }
-            var cache = ClubCache(v: 5, width: w, height: h, frames: frames)
+            var cache = ClubCache(v: 6, width: w, height: h, frames: frames)
             cache.ballCands = ballCands
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
