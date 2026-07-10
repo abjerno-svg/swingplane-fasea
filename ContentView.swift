@@ -731,12 +731,13 @@ struct SkeletonVideo: View {
     @State private var planeLines: [PlaneLine] = []
     var showClubTrail: Bool = false
     var showPlaneLines: Bool = false
+    var showSkeleton: Bool = true
     var onAnalysisState: ((Bool, Bool, Int) -> Void)? = nil   // (poseBusy, clubBusy, punkter)
 
     var body: some View {
         ZStack {
             VideoPlayer(player: player)
-            if let cache {
+            if showSkeleton, let cache {
                 PoseOverlay(pose: currentPose,
                             videoSize: CGSize(width: cache.width, height: cache.height),
                             fill: false)
@@ -793,10 +794,14 @@ struct SkeletonVideo: View {
         let early = cc.frames.filter { $0.t <= 0.4 }
         let t0 = early.isEmpty ? 0.15 : early[early.count / 2].t
         let pose = PoseAnalyzer.pose(at: t0, in: pc)
-        // Forventet boldposition ved address: under haenderne, i ankelhoejde.
-        // Vaelg kandidaten naermest forventningen (loese bolde paa maatten kan have HOEJERE conf).
+        // Forventet boldposition ved address = KLUBHOVEDETS median i de foerste 0,4s
+        // (v4 detekterer det paalideligt; bolden ligger klos op ad klubhovedet ved address).
+        // Fallback: pose-heuristik (under haenderne, ankelhoejde) hvis ingen tidlige klub-frames.
         var expected: CGPoint? = nil
-        if let w = pose[.rightWrist] ?? pose[.leftWrist] {
+        if early.count >= 3 {
+            let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
+            expected = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
+        } else if let w = pose[.rightWrist] ?? pose[.leftWrist] {
             let ankleY = (pose[.rightAnkle] ?? pose[.leftAnkle])?.y ?? min(w.y + 0.25, 0.95)
             expected = CGPoint(x: w.x, y: ankleY)
         }
@@ -840,6 +845,8 @@ struct ClipPlayerView: View {
     @State private var scrubbing = false
     @State private var timeObs: Any? = nil
     @State private var comment = ""
+    @State private var showSkeleton = true
+    @State private var fullscreen = false
     @State private var showTrail = false
     @State private var showPlane = false
     @State private var poseBusy = true
@@ -850,6 +857,7 @@ struct ClipPlayerView: View {
         VStack {
             SkeletonVideo(clip: clip, player: player,
                           showClubTrail: showTrail, showPlaneLines: showPlane,
+                          showSkeleton: showSkeleton,
                           onAnalysisState: { p, c, n in
                               poseBusy = p; clubBusy = c; clubPoints = n
                           })
@@ -884,6 +892,11 @@ struct ClipPlayerView: View {
             }
             .padding(.horizontal, 16).padding(.top, 4)
             HStack(spacing: 10) {
+                Toggle(isOn: $showSkeleton) {
+                    Label("Skelet", systemImage: "figure.stand")
+                        .font(.caption.weight(.semibold))
+                }
+                .toggleStyle(.button).tint(.spGold)
                 Toggle(isOn: $showTrail) {
                     Label(clubBusy ? "Analyserer…" : "Klubhoved-spor",
                           systemImage: clubBusy ? "hourglass" : "scribble.variable")
@@ -920,7 +933,57 @@ struct ClipPlayerView: View {
         .toolbar {
             // Del klip (fx til OneDrive) -> analyse paa PC'en
             ToolbarItem(placement: .primaryAction) {
+                Button { fullscreen = true } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
                 ShareLink(item: clip.url) { Image(systemName: "square.and.arrow.up") }
+            }
+        }
+        .fullScreenCover(isPresented: $fullscreen) {
+            ZStack(alignment: .topTrailing) {
+                Color.black.ignoresSafeArea()
+                SkeletonVideo(clip: clip, player: player,
+                              showClubTrail: showTrail, showPlaneLines: showPlane,
+                              showSkeleton: showSkeleton)
+                Button { fullscreen = false } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 30)).foregroundStyle(.white.opacity(0.85))
+                        .padding(16)
+                }
+                // Samme kontroller som i afspilleren - live bindinger til samme state
+                VStack {
+                    Spacer()
+                    HStack(spacing: 8) {
+                        Toggle(isOn: $showSkeleton) {
+                            Image(systemName: "figure.stand").font(.caption.weight(.semibold))
+                        }
+                        .toggleStyle(.button).tint(.spGold)
+                        Toggle(isOn: $showTrail) {
+                            Image(systemName: "scribble.variable").font(.caption.weight(.semibold))
+                        }
+                        .toggleStyle(.button).tint(.spGold)
+                        .disabled(clubBusy || ClubAnalyzer.model == nil)
+                        if clip.view == .dtl {
+                            Toggle(isOn: $showPlane) {
+                                Image(systemName: "line.diagonal").font(.caption.weight(.semibold))
+                            }
+                            .toggleStyle(.button).tint(.spGold)
+                            .disabled(clubBusy || poseBusy)
+                        }
+                        Spacer()
+                        Button { player.pause(); player.currentItem?.step(byCount: -1) } label: {
+                            Image(systemName: "backward.frame").font(.title3).foregroundStyle(.white)
+                        }
+                        Button { player.pause(); player.currentItem?.step(byCount: 1) } label: {
+                            Image(systemName: "forward.frame").font(.title3).foregroundStyle(.white)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.black.opacity(0.45)).clipShape(Capsule())
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+                }
             }
         }
         .onAppear {
@@ -1143,8 +1206,11 @@ struct PlaneLinesOverlay: View {
                 let p1 = CGPoint(x: a.x - dx * 10, y: a.y - dy * 10)
                 let p2 = CGPoint(x: a.x + dx * 10, y: a.y + dy * 10)
                 var path = Path(); path.move(to: p1); path.addLine(to: p2)
-                ctx.stroke(path, with: .color(line.color.opacity(0.8)),
-                           style: StrokeStyle(lineWidth: 2.5, dash: [7, 5]))
+                // moerk kontur bagved -> synlig mod baade lys himmel og groent graes
+                ctx.stroke(path, with: .color(.black.opacity(0.55)),
+                           style: StrokeStyle(lineWidth: 6, dash: [10, 7]))
+                ctx.stroke(path, with: .color(line.color.opacity(0.95)),
+                           style: StrokeStyle(lineWidth: 3.5, dash: [10, 7]))
             }
         }
     }
