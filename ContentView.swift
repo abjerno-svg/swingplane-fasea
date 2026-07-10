@@ -73,7 +73,7 @@ enum ClubAnalyzer {
     static func loadOrCompute(for clipURL: URL, completion: @escaping (ClubCache?) -> Void) {
         let cacheURL = cacheURL(for: clipURL)
         if let data = try? Data(contentsOf: cacheURL),
-           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 6 {
+           let cache = try? JSONDecoder().decode(ClubCache.self, from: data), cache.v >= 7 {
             completion(cache); return
         }
         guard let model = model else { completion(nil); return }
@@ -105,7 +105,7 @@ enum ClubAnalyzer {
                 }
                 t += step
             }
-            var cache = ClubCache(v: 6, width: w, height: h, frames: frames)
+            var cache = ClubCache(v: 7, width: w, height: h, frames: frames)
             cache.ballCands = ballCands
             if let data = try? JSONEncoder().encode(cache) { try? data.write(to: cacheURL) }
             DispatchQueue.main.async { completion(cache) }
@@ -138,9 +138,16 @@ enum ClubAnalyzer {
         // Ingen flip: CGContext.draw laegger CGImage OPRET i bufferen.
         // Rect oeverst i CG-koordinater (y: 640-sh) = raekke 0..sh i hukommelsen = TOP-venstre.
         ctx.draw(cg, in: CGRect(x: 0, y: 640 - sh, width: sw, height: sh))
-        guard let inp = try? MLDictionaryFeatureProvider(dictionary: ["images": MLFeatureValue(pixelBuffer: buf)]),
-              let outp = try? model.prediction(from: inp),
-              let arr = outp.featureValue(for: "output0")?.multiArrayValue else { return (nil, []) }
+        // Navne-agnostisk: v3-konverteringen hed images/output0, ultralytics-eksport hedder image/var_xxx
+        guard let inputName = model.modelDescription.inputDescriptionsByName.keys.first,
+              let inp = try? MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: buf)]),
+              let outp = try? model.prediction(from: inp) else { return (nil, []) }
+        var arrOpt: MLMultiArray? = nil
+        for name in outp.featureNames {
+            if let a = outp.featureValue(for: name)?.multiArrayValue,
+               a.shape.map(\.intValue).contains(8400) { arrOpt = a; break }
+        }
+        guard let arr = arrOpt else { return (nil, []) }
         let n = 8400
         let shape = arr.shape.map(\.intValue)
         let strides = arr.strides.map(\.intValue)
