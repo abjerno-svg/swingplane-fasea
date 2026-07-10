@@ -241,7 +241,12 @@ struct Clip: Identifiable {
     let view: SwingView
     let date: Date
     let impact: Double?     // sekunder inde i klippet, hvis kendt
+    let number: Int         // stabilt sving-nummer (aendres ALDRIG ved sletning)
+    let comment: String
 }
+
+/// Sidefil .meta.json: stabilt nummer + brugerens kommentar
+struct ClipMeta: Codable { var n: Int; var comment: String? }
 
 final class ClipStore: ObservableObject {
     @Published var clips: [Clip] = []
@@ -262,18 +267,51 @@ final class ClipStore: ObservableObject {
         return directory.appendingPathComponent("swing_\(ts)_\(view.fileKey)_\(imp).mov")
     }
 
+    static func metaURL(for url: URL) -> URL {
+        url.deletingPathExtension().appendingPathExtension("meta.json")
+    }
+
+    func setComment(_ clip: Clip, _ text: String) {
+        var meta = ClipMeta(n: clip.number, comment: text)
+        if let d = try? Data(contentsOf: Self.metaURL(for: clip.url)),
+           let m = try? JSONDecoder().decode(ClipMeta.self, from: d) { meta = m; meta.comment = text }
+        if let d = try? JSONEncoder().encode(meta) { try? d.write(to: Self.metaURL(for: clip.url)) }
+        if let i = clips.firstIndex(where: { $0.id == clip.id }) {
+            clips[i] = Clip(url: clip.url, view: clip.view, date: clip.date, impact: clip.impact,
+                            number: clip.number, comment: text)
+        }
+    }
+
     func reload() {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: Self.directory, includingPropertiesForKeys: nil)) ?? []
-        var result: [Clip] = []
+        var parsed: [(url: URL, view: SwingView, date: Date, impact: Double?)] = []
         for url in files where url.pathExtension == "mov" {
             let parts = url.deletingPathExtension().lastPathComponent.split(separator: "_")
             guard parts.count >= 3, let ts = Double(parts[1]) else { continue }
             let view = SwingView.fromFileKey(String(parts[2]))
             var impact: Double? = nil
             if parts.count >= 4, let ms = Double(parts[3]) { impact = ms / 1000 }
-            result.append(Clip(url: url, view: view, date: Date(timeIntervalSince1970: ts), impact: impact))
+            parsed.append((url, view, Date(timeIntervalSince1970: ts), impact))
         }
+        // Stabile sving-numre: .meta.json pr. klip + monoton taeller i UserDefaults
+        var counter = UserDefaults.standard.integer(forKey: "swingCounter")
+        var result: [Clip] = []
+        for e in parsed.sorted(by: { $0.date < $1.date }) {
+            let mURL = Self.metaURL(for: e.url)
+            let meta: ClipMeta
+            if let d = try? Data(contentsOf: mURL), let m = try? JSONDecoder().decode(ClipMeta.self, from: d) {
+                meta = m
+                counter = max(counter, m.n)
+            } else {
+                counter += 1
+                meta = ClipMeta(n: counter, comment: nil)
+                if let d = try? JSONEncoder().encode(meta) { try? d.write(to: mURL) }
+            }
+            result.append(Clip(url: e.url, view: e.view, date: e.date, impact: e.impact,
+                               number: meta.n, comment: meta.comment ?? ""))
+        }
+        UserDefaults.standard.set(counter, forKey: "swingCounter")
         let sorted = result.sorted { $0.date > $1.date }
         // Auto-loft: slet ældste ud over maxClips
         if sorted.count > Self.maxClips {
@@ -290,6 +328,7 @@ final class ClipStore: ObservableObject {
         try? FileManager.default.removeItem(at: PoseAnalyzer.cacheURL(for: clip.url))
         try? FileManager.default.removeItem(at: ClubAnalyzer.cacheURL(for: clip.url))
         try? FileManager.default.removeItem(at: clip.url.deletingPathExtension().appendingPathExtension("thumb.jpg"))
+        try? FileManager.default.removeItem(at: Self.metaURL(for: clip.url))
     }
 
     func delete(_ clip: Clip) { removeFiles(clip); reload() }
@@ -443,9 +482,16 @@ struct CameraScreen: View {
                 }
                 .padding(.top, 10)
                 if camera.autoListening { ListeningBadge() }
-                badge(camera.statusText)
-                badge(camera.poseInfo)
-                FramingChecklist(camera: camera).padding(.top, 4)
+                // Valideringer i venstre side - ikke midt i billedet (front-kamera)
+                HStack {
+                    VStack(alignment: .leading, spacing: 6) {
+                        badge(camera.statusText)
+                        badge(camera.poseInfo)
+                        FramingChecklist(camera: camera)
+                    }
+                    Spacer()
+                }
+                .padding(.top, 4)
 
                 Spacer()
 
@@ -541,11 +587,6 @@ struct LibraryView: View {
         return store.clips.filter { $0.view == f }
     }
 
-    private func swingNumber(_ clip: Clip) -> Int {
-        let ordered = store.clips.sorted { $0.date < $1.date }
-        return (ordered.firstIndex { $0.id == clip.id } ?? 0) + 1
-    }
-
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -573,7 +614,7 @@ struct LibraryView: View {
                 } else {
                     List {
                         ForEach(filtered) { clip in
-                            NavigationLink { ClipPlayerView(clip: clip) } label: { ClipRow(clip: clip, number: swingNumber(clip)) }
+                            NavigationLink { ClipPlayerView(clip: clip, store: store) } label: { ClipRow(clip: clip) }
                         }
                         .onDelete { offsets in offsets.forEach { store.delete(filtered[$0]) } }
                     }
@@ -596,7 +637,6 @@ struct LibraryView: View {
 
 struct ClipRow: View {
     let clip: Clip
-    var number: Int = 0
     @State private var durationText = ""
     private static let fmt: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "d. MMM HH:mm"; return f
@@ -606,7 +646,7 @@ struct ClipRow: View {
         HStack(spacing: 12) {
             ClipThumbnail(url: clip.url)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Sving \(number)").font(.body.weight(.semibold))
+                Text("Sving \(clip.number)").font(.body.weight(.semibold))
                 HStack(spacing: 6) {
                     Image(systemName: clip.view == .dtl ? "figure.golf" : "person.fill")
                         .font(.caption2).foregroundStyle(Color.spGold)
@@ -616,6 +656,12 @@ struct ClipRow: View {
                     }
                 }
                 Text(Self.fmt.string(from: clip.date)).font(.caption2).foregroundStyle(.secondary)
+                if !clip.comment.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "text.bubble").font(.caption2).foregroundStyle(Color.spGold)
+                        Text(clip.comment).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
             }
             Spacer()
             Image(systemName: "play.circle").foregroundStyle(.secondary)
@@ -780,7 +826,13 @@ struct SkeletonVideo: View {
 
 struct ClipPlayerView: View {
     let clip: Clip
+    var store: ClipStore? = nil
     @State private var player = AVPlayer()
+    @State private var duration: Double = 0
+    @State private var current: Double = 0
+    @State private var scrubbing = false
+    @State private var timeObs: Any? = nil
+    @State private var comment = ""
     @State private var showTrail = false
     @State private var showPlane = false
     @State private var poseBusy = true
@@ -795,13 +847,35 @@ struct ClipPlayerView: View {
                               poseBusy = p; clubBusy = c; clubPoints = n
                           })
                 .frame(maxHeight: 520)
-            HStack(spacing: 24) {
-                Button { player.seek(to: .zero); player.play() } label: {
-                    Image(systemName: "gobackward").font(.title2)
+            VStack(spacing: 2) {
+                Slider(value: Binding(
+                    get: { current },
+                    set: { v in
+                        current = v
+                        player.seek(to: CMTime(seconds: v, preferredTimescale: 600),
+                                    toleranceBefore: .zero, toleranceAfter: .zero)
+                    }), in: 0...max(duration, 0.01),
+                    onEditingChanged: { editing in
+                        scrubbing = editing
+                        if editing { player.pause() }
+                    })
+                    .tint(.spGold)
+                HStack(spacing: 24) {
+                    Button { player.pause(); player.currentItem?.step(byCount: -1) } label: {
+                        Image(systemName: "backward.frame").font(.title3)
+                    }
+                    Button { player.seek(to: .zero); player.play() } label: {
+                        Image(systemName: "gobackward").font(.title2)
+                    }
+                    Button { player.play() } label: { Image(systemName: "play.fill").font(.title) }
+                    Button { player.pause() } label: { Image(systemName: "pause.fill").font(.title2) }
+                    Button { player.pause(); player.currentItem?.step(byCount: 1) } label: {
+                        Image(systemName: "forward.frame").font(.title3)
+                    }
                 }
-                Button { player.play() } label: { Image(systemName: "play.fill").font(.title) }
-                Button { player.pause() } label: { Image(systemName: "pause.fill").font(.title2) }
-            }.padding(.top, 8)
+                Text(String(format: "%.2f s", current)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16).padding(.top, 4)
             HStack(spacing: 10) {
                 Toggle(isOn: $showTrail) {
                     Label(clubBusy ? "Analyserer…" : "Klubhoved-spor",
@@ -825,6 +899,13 @@ struct ClipPlayerView: View {
             } else if !clubBusy {
                 Text("Klubhoved: \(clubPoints) punkter").font(.caption2).foregroundStyle(.secondary)
             }
+            HStack(spacing: 8) {
+                Image(systemName: "text.bubble").foregroundStyle(Color.spGold)
+                TextField("Kommentar til svinget…", text: $comment, axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(1...3)
+                    .onSubmit { store?.setComment(clip, comment) }
+            }
+            .padding(.horizontal, 16).padding(.top, 6)
             Spacer()
         }
         .navigationTitle(clip.view.rawValue)
@@ -834,6 +915,21 @@ struct ClipPlayerView: View {
             ToolbarItem(placement: .primaryAction) {
                 ShareLink(item: clip.url) { Image(systemName: "square.and.arrow.up") }
             }
+        }
+        .onAppear {
+            comment = clip.comment
+            timeObs = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.03, preferredTimescale: 600), queue: .main) { time in
+                if !scrubbing { current = CMTimeGetSeconds(time) }
+            }
+        }
+        .task {
+            let sec = (try? await AVURLAsset(url: clip.url).load(.duration).seconds) ?? 0
+            if sec.isFinite && sec > 0 { duration = sec }
+        }
+        .onDisappear {
+            if let timeObs { player.removeTimeObserver(timeObs) }
+            if comment != clip.comment { store?.setComment(clip, comment) }
         }
     }
 }
@@ -901,7 +997,7 @@ struct SyncReviewView: View {
                 ForEach(clips) { c in
                     Button { selection.wrappedValue = c } label: {
                         Label {
-                            Text("Sving \(swingNumber(c)) · \(ClipRow.dateString(c.date))")
+                            Text("Sving \(c.number) · \(ClipRow.dateString(c.date))")
                         } icon: {
                             if let ui = cachedThumb(c) {
                                 Image(uiImage: ui)
@@ -912,17 +1008,12 @@ struct SyncReviewView: View {
                     }
                 }
             } label: {
-                Text(selection.wrappedValue.map { "Sving \(swingNumber($0)) · \(title)" } ?? "Vælg \(title)")
+                Text(selection.wrappedValue.map { "Sving \($0.number) · \(title)" } ?? "Vælg \(title)")
                     .font(.caption)
             }
         }
     }
 
-    /// Samme logiske nummerering som i biblioteket (kronologisk).
-    private func swingNumber(_ clip: Clip) -> Int {
-        let ordered = store.clips.sorted { $0.date < $1.date }
-        return (ordered.firstIndex { $0.id == clip.id } ?? 0) + 1
-    }
     /// Thumbnail fra bibliotekets cache (.thumb.jpg-sidefil); nedskaleret til menu-ikon.
     private func cachedThumb(_ clip: Clip) -> UIImage? {
         let thumb = clip.url.deletingPathExtension().appendingPathExtension("thumb.jpg")
@@ -1414,8 +1505,11 @@ final class CameraManager: NSObject, ObservableObject {
         let bcx = (minX + maxX) / 2
         centered = bcx > 0.34 && bcx < 0.66
         let height = maxY - minY
-        if height < 0.42 { distanceOK = false; distanceHint = "Træd tættere på" }
-        else if height > 0.72 { distanceOK = false; distanceHint = "Træd tilbage" }
+        // Front-kamera: bredere baand (man staar laengere vaek for at kunne se skaermen)
+        let minH: CGFloat = isFrontCamera ? 0.26 : 0.42
+        let maxH: CGFloat = isFrontCamera ? 0.82 : 0.72
+        if height < minH { distanceOK = false; distanceHint = "Træd tættere på" }
+        else if height > maxH { distanceOK = false; distanceHint = "Træd tilbage" }
         else { distanceOK = true; distanceHint = "" }
         clubHeadroom = minY > 0.12
         if let ls = pose[.leftShoulder], let rs = pose[.rightShoulder], height > 0.01 {
@@ -1646,12 +1740,15 @@ struct ContentView: View {
     @State private var step: FlowStep = .start
     @State private var mode: SessionMode = .multiple
     @State private var angle: SwingView = .dtl
+    @StateObject private var rootStore = ClipStore()
+    @State private var showLibrary = false
 
     var body: some View {
         ZStack {
             switch step {
             case .start:
-                OnboardingView { m in mode = m; step = .angle }
+                OnboardingView(onSelect: { m in mode = m; step = .angle },
+                               onLibrary: { showLibrary = true })
                     .transition(.opacity)
             case .angle:
                 AngleSelectView(onPick: { a in angle = a; step = .camera },
@@ -1663,11 +1760,13 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: step)
+        .sheet(isPresented: $showLibrary) { LibraryView(store: rootStore) }
     }
 }
 
 struct OnboardingView: View {
     var onSelect: (SessionMode) -> Void
+    var onLibrary: () -> Void = {}
     @State private var showTutorial = false
     var body: some View {
         ZStack {
@@ -1690,6 +1789,17 @@ struct OnboardingView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.top, 6)
+                Button { onLibrary() } label: {
+                    Label("My swings", systemImage: "square.stack.3d.up.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18).padding(.vertical, 10)
+                        .background(Color.spSurface)
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(Color.spGold.opacity(0.4), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 2)
                 Spacer()
                 Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") · Build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
                     .font(.caption2).foregroundStyle(.white.opacity(0.35))
