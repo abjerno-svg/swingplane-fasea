@@ -794,31 +794,28 @@ struct SkeletonVideo: View {
         let early = cc.frames.filter { $0.t <= 0.4 }
         let t0 = early.isEmpty ? 0.15 : early[early.count / 2].t
         let pose = PoseAnalyzer.pose(at: t0, in: pc)
-        // Forventet boldposition ved address = KLUBHOVEDETS median i de foerste 0,4s
-        // (v4 detekterer det paalideligt; bolden ligger klos op ad klubhovedet ved address).
-        // Fallback: pose-heuristik (under haenderne, ankelhoejde) hvis ingen tidlige klub-frames.
-        var expected: CGPoint? = nil
+        // Anker = KLUBHOVEDET ved address (median af foerste 0,4s). Ingen bold-udvaelgelse -
+        // v4 ser klubhovedet paalideligt, og bolden staar klos op ad det ved address.
+        let ball: CGPoint
         if early.count >= 3 {
             let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
-            expected = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
-        } else if let w = pose[.rightWrist] ?? pose[.leftWrist] {
-            let ankleY = (pose[.rightAnkle] ?? pose[.leftAnkle])?.y ?? min(w.y + 0.25, 0.95)
-            expected = CGPoint(x: w.x, y: ankleY)
-        }
-        let ball: CGPoint
-        if let exp = expected, !cc.ballCands.isEmpty {
-            let bestCand = cc.ballCands.min { a, b in
-                let da = hypot(a[0] - exp.x, a[1] - exp.y) - 0.05 * a[2]
-                let db = hypot(b[0] - exp.x, b[1] - exp.y) - 0.05 * b[2]
-                return da < db
-            }!
-            ball = CGPoint(x: bestCand[0], y: bestCand[1])
+            ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
         } else if !cc.ballCands.isEmpty {
-            let xs = cc.ballCands.map { $0[0] }.sorted(), ys = cc.ballCands.map { $0[1] }.sorted()
-            ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
-        } else if !early.isEmpty {
-            let xs = early.map(\.x).sorted(), ys = early.map(\.y).sorted()
-            ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
+            // Fallback (klubhoved ikke set tidligt): bold-kandidat naermest pose-forventning
+            var exp: CGPoint? = nil
+            if let w = pose[.rightWrist] ?? pose[.leftWrist] {
+                let ankleY = (pose[.rightAnkle] ?? pose[.leftAnkle])?.y ?? min(w.y + 0.25, 0.95)
+                exp = CGPoint(x: w.x, y: ankleY)
+            }
+            if let e = exp {
+                let best = cc.ballCands.min(by: {
+                    hypot($0[0] - e.x, $0[1] - e.y) < hypot($1[0] - e.x, $1[1] - e.y)
+                })!
+                ball = CGPoint(x: best[0], y: best[1])
+            } else {
+                let xs = cc.ballCands.map { $0[0] }.sorted(), ys = cc.ballCands.map { $0[1] }.sorted()
+                ball = CGPoint(x: xs[xs.count / 2], y: ys[ys.count / 2])
+            }
         } else { return }
         var lines: [PlaneLine] = []
         if let rh = pose[.rightHip], let lh = pose[.leftHip] {
@@ -928,7 +925,7 @@ struct ClipPlayerView: View {
             .padding(.horizontal, 16).padding(.top, 6)
             Spacer()
         }
-        .navigationTitle(clip.view.rawValue)
+        .navigationTitle("Sving \(clip.number) · \(clip.view.rawValue)")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             // Del klip (fx til OneDrive) -> analyse paa PC'en
@@ -942,37 +939,61 @@ struct ClipPlayerView: View {
             }
         }
         .fullScreenCover(isPresented: $fullscreen) {
-            ZStack(alignment: .topTrailing) {
+            ZStack {
                 Color.black.ignoresSafeArea()
                 SkeletonVideo(clip: clip, player: player,
                               showClubTrail: showTrail, showPlaneLines: showPlane,
                               showSkeleton: showSkeleton)
-                Button { fullscreen = false } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 30)).foregroundStyle(.white.opacity(0.85))
-                        .padding(16)
-                }
-                // Samme kontroller som i afspilleren - live bindinger til samme state
+                // Top: sving-navn + luk
                 VStack {
+                    HStack {
+                        Text("Sving \(clip.number) · \(clip.view.rawValue)")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.black.opacity(0.5)).clipShape(Capsule())
+                        Spacer()
+                        Button { fullscreen = false } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 30)).foregroundStyle(.white.opacity(0.85))
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.top, 8)
                     Spacer()
-                    HStack(spacing: 8) {
+                    // Bund: samme slider som i normal visning
+                    Slider(value: Binding(
+                        get: { current },
+                        set: { v in
+                            current = v
+                            player.seek(to: CMTime(seconds: v, preferredTimescale: 600),
+                                        toleranceBefore: .zero, toleranceAfter: .zero)
+                        }), in: 0...max(duration, 0.01),
+                        onEditingChanged: { editing in
+                            scrubbing = editing
+                            if editing { player.pause() }
+                        })
+                        .tint(.spGold)
+                        .padding(.horizontal, 18).padding(.bottom, 14)
+                }
+                // Venstre side: lodret kontrol-soejle
+                HStack {
+                    VStack(spacing: 14) {
                         Toggle(isOn: $showSkeleton) {
-                            Image(systemName: "figure.stand").font(.caption.weight(.semibold))
+                            Image(systemName: "figure.stand").font(.body.weight(.semibold))
                         }
                         .toggleStyle(.button).tint(.spGold)
                         Toggle(isOn: $showTrail) {
-                            Image(systemName: "scribble.variable").font(.caption.weight(.semibold))
+                            Image(systemName: "scribble.variable").font(.body.weight(.semibold))
                         }
                         .toggleStyle(.button).tint(.spGold)
                         .disabled(clubBusy || ClubAnalyzer.model == nil)
                         if clip.view == .dtl {
                             Toggle(isOn: $showPlane) {
-                                Image(systemName: "line.diagonal").font(.caption.weight(.semibold))
+                                Image(systemName: "line.diagonal").font(.body.weight(.semibold))
                             }
                             .toggleStyle(.button).tint(.spGold)
                             .disabled(clubBusy || poseBusy)
                         }
-                        Spacer()
+                        Divider().frame(width: 28).overlay(.white.opacity(0.4))
                         Button { player.pause(); player.currentItem?.step(byCount: -1) } label: {
                             Image(systemName: "backward.frame").font(.title3).foregroundStyle(.white)
                         }
@@ -980,9 +1001,10 @@ struct ClipPlayerView: View {
                             Image(systemName: "forward.frame").font(.title3).foregroundStyle(.white)
                         }
                     }
-                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .padding(.vertical, 14).padding(.horizontal, 8)
                     .background(.black.opacity(0.45)).clipShape(Capsule())
-                    .padding(.horizontal, 12).padding(.bottom, 8)
+                    .padding(.leading, 10)
+                    Spacer()
                 }
             }
         }
